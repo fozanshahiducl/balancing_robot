@@ -1,0 +1,250 @@
+===> You are running rebar3_grisp with Erlang/OTP-25!
+rebar3_grisp deprecates this OTP version and will drop support for it in the next releases!
+Please upgrade to OTP 27 or newer before upgrading this plugin!
+===> Verifying dependencies...
+===> Analyzing applications...
+===> Compiling balancing_robot
+===> Compiling src/main_loop.erl failed
+    ┌─ src/main_loop.erl:
+    │
+ 97 │      {Adv_V_Traj, Turn_V_Traj, Trajectory_State_New} = trajectory_layer:step(Trajectory_State, {Dt, Speed_L, Speed_R, Forward, Robot_Up}),
+    │      ╰── syntax error before: '{'
+
+    ┌─ src/main_loop.erl:
+    │
+ 99 │      Adv_V_Traj = 0.0,
+    │      ╰── syntax error before: Adv_V_Traj
+
+     ┌─ src/main_loop.erl:
+     │
+ 105 │      Adv_V_Goal = speed_ref(Forward, Backward) + Adv_V_Traj,
+     │      ╰── syntax error before: Adv_V_Goal
+
+
+    ┌─ src/main_loop.erl:
+    │
+ 96 │      -ifdef(ENABLE_TRAJECTORY).
+    │       ╰── function ifdef/1 undefined
+
+    ┌─ src/main_loop.erl:
+    │
+ 96 │      -ifdef(ENABLE_TRAJECTORY).
+    │             ╰── variable 'ENABLE_TRAJECTORY' is unbound
+
+
+    ┌─ src/main_loop.erl:
+    │
+ 66 │  robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}, Trajectory_State) ->
+    │             ╰── Warning: variable 'Start_Time' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 66 │  robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}, Trajectory_State) ->
+    │                         ╰── Warning: variable 'Hera_pid' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 66 │  robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}, Trajectory_State) ->
+    │                                    ╰── Warning: variable 'Robot_State' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 66 │  robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}, Trajectory_State) ->
+    │                                                 ╰── Warning: variable 'Robot_Up' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 66 │  robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}, Trajectory_State) ->
+    │                                                                 ╰── Warning: variable 'X0' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 66 │  robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}, Trajectory_State) ->
+    │                                                                     ╰── Warning: variable 'P0' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 66 │  robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}, Trajectory_State) ->
+    │                                                                                   ╰── Warning: variable 'Logging' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 66 │  robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}, Trajectory_State) ->
+    │                                                                                            ╰── Warning: variable 'Log_End' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 66 │  robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}, Trajectory_State) ->
+    │                                                                                                     ╰── Warning: variable 'Log_List' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 66 │  robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}, Trajectory_State) ->
+    │                                                                                                                 ╰── Warning: variable 'Gy0' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 66 │  robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}, Trajectory_State) ->
+    │                                                                                                                      ╰── Warning: variable 'Angle_Complem' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 66 │  robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}, Trajectory_State) ->
+    │                                                                                                                                     ╰── Warning: variable 'Angle_Rate' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 66 │  robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}, Trajectory_State) ->
+    │                                                                                                                                                   ╰── Warning: variable 'Pid_Speed' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 66 │  robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}, Trajectory_State) ->
+    │                                                                                                                                                              ╰── Warning: variable 'Pid_Stability' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 66 │  robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}, Trajectory_State) ->
+    │                                                                                                                                                                               ╰── Warning: variable 'Adv_V_Ref' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 66 │  robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}, Trajectory_State) ->
+    │                                                                                                                                                                                          ╰── Warning: variable 'Turn_V_Ref' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 66 │  robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}, Trajectory_State) ->
+    │                                                                                                                                                                                                        ╰── Warning: variable 'N' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 66 │  robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}, Trajectory_State) ->
+    │                                                                                                                                                                                                           ╰── Warning: variable 'Freq' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 66 │  robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}, Trajectory_State) ->
+    │                                                                                                                                                                                                                 ╰── Warning: variable 'Mean_Freq' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 66 │  robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}, Trajectory_State) ->
+    │                                                                                                                                                                                                                            ╰── Warning: variable 'T_End' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 66 │  robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}, Trajectory_State) ->
+    │                                                                                                                                                                                                                                    ╰── Warning: variable 'Trajectory_State' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 70 │  	Dt = (T1- T0)/1000.0,            %[s]
+    │  	╰── Warning: variable 'Dt' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 77 │      [Gy,Ax,Az] = pmod_nav:read(acc, [out_y_g, out_x_xl, out_z_xl], #{g_unit => dps}),
+    │       ╰── Warning: variable 'Gy' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 77 │      [Gy,Ax,Az] = pmod_nav:read(acc, [out_y_g, out_x_xl, out_z_xl], #{g_unit => dps}),
+    │          ╰── Warning: variable 'Ax' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 77 │      [Gy,Ax,Az] = pmod_nav:read(acc, [out_y_g, out_x_xl, out_z_xl], #{g_unit => dps}),
+    │             ╰── Warning: variable 'Az' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 86 │      Speed = (Speed_L + Speed_R)/2,
+    │      ╰── Warning: variable 'Speed' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 89 │      [Arm_Ready, Switch, Test, Get_Up, Forward, Backward, Left, Right] = hera_com:get_bits(CtrlByte),
+    │       ╰── Warning: variable 'Arm_Ready' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 89 │      [Arm_Ready, Switch, Test, Get_Up, Forward, Backward, Left, Right] = hera_com:get_bits(CtrlByte),
+    │                  ╰── Warning: variable 'Switch' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 89 │      [Arm_Ready, Switch, Test, Get_Up, Forward, Backward, Left, Right] = hera_com:get_bits(CtrlByte),
+    │                          ╰── Warning: variable 'Test' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 89 │      [Arm_Ready, Switch, Test, Get_Up, Forward, Backward, Left, Right] = hera_com:get_bits(CtrlByte),
+    │                                ╰── Warning: variable 'Get_Up' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 89 │      [Arm_Ready, Switch, Test, Get_Up, Forward, Backward, Left, Right] = hera_com:get_bits(CtrlByte),
+    │                                        ╰── Warning: variable 'Forward' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 89 │      [Arm_Ready, Switch, Test, Get_Up, Forward, Backward, Left, Right] = hera_com:get_bits(CtrlByte),
+    │                                                 ╰── Warning: variable 'Backward' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 89 │      [Arm_Ready, Switch, Test, Get_Up, Forward, Backward, Left, Right] = hera_com:get_bits(CtrlByte),
+    │                                                           ╰── Warning: variable 'Left' is unused
+
+    ┌─ src/main_loop.erl:
+    │
+ 89 │      [Arm_Ready, Switch, Test, Get_Up, Forward, Backward, Left, Right] = hera_com:get_bits(CtrlByte),
+    │                                                                 ╰── Warning: variable 'Right' is unused
+
+     ┌─ src/main_loop.erl:
+     │
+ 351 │  kalman_angle(Dt, Ax, Az, Gy, Gy0, X0, P0) ->
+     │  ╰── Warning: function kalman_angle/7 is unused
+
+     ┌─ src/main_loop.erl:
+     │
+ 373 │  complem_angle({Dt, Ax, Az, Gy, Gy0, K, Angle_Complem, Angle_Rate}) ->
+     │  ╰── Warning: function complem_angle/1 is unused
+
+     ┌─ src/main_loop.erl:
+     │
+ 388 │  select_angle(Switch, Angle_Kalman, Angle_Complem) ->
+     │  ╰── Warning: function select_angle/3 is unused
+
+     ┌─ src/main_loop.erl:
+     │
+ 397 │  speed_ref(Forward, Backward) ->
+     │  ╰── Warning: function speed_ref/2 is unused
+
+     ┌─ src/main_loop.erl:
+     │
+ 408 │  turn_ref(Left, Right) ->
+     │  ╰── Warning: function turn_ref/2 is unused
+
+     ┌─ src/main_loop.erl:
+     │
+ 420 │  frequency_computation(Dt, N, Freq, Mean_Freq) ->
+     │  ╰── Warning: function frequency_computation/4 is unused
+
+     ┌─ src/main_loop.erl:
+     │
+ 433 │  wait(T) -> 
+     │  ╰── Warning: function wait/1 is unused
+
+     ┌─ src/main_loop.erl:
+     │
+ 436 │  wait_help(Tnow, Tend) when Tnow >= Tend -> ok;
+     │  ╰── Warning: function wait_help/2 is unused
+
+     ┌─ src/main_loop.erl:
+     │
+ 442 │  get_byte(List) ->
+     │  ╰── Warning: function get_byte/1 is unused
+
+
