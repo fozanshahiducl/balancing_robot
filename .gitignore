@@ -1,2 +1,9 @@
 _build
 _grisp
+
+Movement_Mechanism.md
+path_visualizer.html
+traj_log.py
+traj_log.csv
+Trajectory_Logic.md
+old_rebar.config

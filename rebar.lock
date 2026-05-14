@@ -1,0 +1,27 @@
+{"1.2.0",
+[{<<"epmd">>,
+  {git,"https://github.com/erlang/epmd",
+       {ref,"4d1a595b9d5c32fc0e55f462da381de62de23bf0"}},
+  0},
+ {<<"grisp">>,
+  {git,"https://github.com/grisp/grisp",
+       {ref,"ddb2c907979aca5985388c35c7201469d9512f39"}},
+  0},
+ {<<"grisp_emulation">>,{pkg,<<"grisp_emulation">>,<<"0.2.2">>},0},
+ {<<"hera">>,
+  {git,"https://github.com/FrancoisGgg/hera",
+       {ref,"483a855bbc397588c9fd388892ff53bd4576225d"}},
+  0},
+ {<<"hera_synchronization">>,
+  {git,"https://github.com/sebkm/hera_synchronization",
+       {ref,"d5344e7d916edff1d58ce0c5357386d4fc6b82e7"}},
+  0},
+ {<<"mapz">>,{pkg,<<"mapz">>,<<"2.4.0">>},1}]}.
+[
+{pkg_hash,[
+ {<<"grisp_emulation">>, <<"FA6246E9F83BC70EB6170BAF47D8A8774A59E787D4DB4CBD9CE480F5CD6EEC71">>},
+ {<<"mapz">>, <<"77A8E38B69BAB16C5D3EBD44E6C619F8AF1F1598B0CAAE301D266605A0865756">>}]},
+{pkg_hash_ext,[
+ {<<"grisp_emulation">>, <<"739B62F810C89A28D3918CAF605FDB3105E79810F47DFB7DC053C0A96495B651">>},
+ {<<"mapz">>, <<"4B68DF5CF0522E0D6545DF7B681BC052865CDB78405AD4CC9C55FE45EE7B25BE">>}]}
+].

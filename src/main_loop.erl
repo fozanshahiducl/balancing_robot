@@ -2,6 +2,8 @@
 
 -export([robot_init/1, modify_frequency/1]).
 
+-define(ENABLE_TRAJECTORY, true).
+
 -define(RAD_TO_DEG, 180.0/math:pi()).
 -define(DEG_TO_RAD, math:pi()/180.0).
 
@@ -58,9 +60,10 @@ robot_init(Hera_pid) ->
 	io:format("[Robot] Starting movement of the robot.~n"),
 
     %Call main loop
-    robot_main(T0, Hera_pid, {rest, false}, {T0, X0, P0}, I2Cbus, {0, T0, []}, {Gy0, 0.0, 0.0}, {Pid_Speed, Pid_Stability}, {0.0, 0.0}, {0, 0, 200.0, T0}).
+    Trajectory_State = trajectory_layer2:init(),
+    robot_main(T0, Hera_pid, {rest, false}, {T0, X0, P0}, I2Cbus, {0, T0, []}, {Gy0, 0.0, 0.0}, {Pid_Speed, Pid_Stability}, {0.0, 0.0}, {0, 0, 200.0, T0}, Trajectory_State).
 
-robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}) ->
+robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, {Logging, Log_End, Log_List}, {Gy0, Angle_Complem, Angle_Rate}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref, Turn_V_Ref}, {N, Freq, Mean_Freq, T_End}, Trajectory_State) ->
 
     %Delta time of loop
     T1 = erlang:system_time()/1.0e6, %[ms]
@@ -89,11 +92,28 @@ robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, 
     %%% Command Logic %%%
     %%%%%%%%%%%%%%%%%%%%%
 
-    %Set advance speed from flags
-    Adv_V_Goal = speed_ref(Forward, Backward),
+    %Trajectory layer integration
+    if ?ENABLE_TRAJECTORY ->
+        {Adv_V_Traj, Turn_V_Traj, Trajectory_State_New} = trajectory_layer2:step(Trajectory_State, {Dt, Speed_L, Speed_R, Forward, Robot_Up});
+    not ?ENABLE_TRAJECTORY ->
+        Adv_V_Traj = 0.0,
+        Turn_V_Traj = 0.0,
+        Trajectory_State_New = Trajectory_State
+    end,
 
-    %Set turning speed from flags
-    Turn_V_Goal = turn_ref(Left, Right),
+    %% While the trajectory is actively driving (running or paused mid-run),
+    %% it owns the velocity command — don't add the manual Forward/Left/Right
+    %% offsets, which would otherwise inject 30 cm/s for the one tick Forward
+    %% is tapped to start the trajectory. In idle/finished, manual control
+    %% works as before.
+    Traj_Status_Now = trajectory_layer2:status(Trajectory_State_New),
+    {Adv_V_Goal, Turn_V_Goal} =
+        case Traj_Status_Now of
+            running -> {Adv_V_Traj, Turn_V_Traj};
+            paused  -> {Adv_V_Traj, Turn_V_Traj};
+            _       -> {speed_ref(Forward, Backward) + Adv_V_Traj,
+                        turn_ref(Left, Right) + Turn_V_Traj}
+        end,
 
     %%%%%%%%%%%%%%%%%%%%%%%%%%
     %%% Angle Computations %%%
@@ -323,7 +343,7 @@ robot_main(Start_Time, Hera_pid, {Robot_State, Robot_Up}, {T0, X0, P0}, I2Cbus, 
     T_End_New = erlang:system_time()/1.0e6,
 
     %Loop back with updated state
-    robot_main(Start_Time, Hera_pid, {Next_Robot_State, Robot_Up_New}, {T1, X1, P1}, I2Cbus, {Logging_New, Log_End_New, Log_List_New}, {Gy0, Angle_Complem_New, Angle_Rate_New}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref_New, Turn_V_Ref_New}, {N_New, Freq_New, Mean_Freq_New, T_End_New}).
+    robot_main(Start_Time, Hera_pid, {Next_Robot_State, Robot_Up_New}, {T1, X1, P1}, I2Cbus, {Logging_New, Log_End_New, Log_List_New}, {Gy0, Angle_Complem_New, Angle_Rate_New}, {Pid_Speed, Pid_Stability}, {Adv_V_Ref_New, Turn_V_Ref_New}, {N_New, Freq_New, Mean_Freq_New, T_End_New}, Trajectory_State_New).
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
