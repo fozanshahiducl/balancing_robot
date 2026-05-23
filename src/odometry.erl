@@ -3,38 +3,28 @@
 %%% ═══════════════════════════════════════════════════════════════════════════
 %%% Differential-drive pose integration from wheel speeds.
 %%%
-%%% integrate/4 updates a #pose{} record every tick using the midpoint-angle
+%%% integrate/3 updates a #pose{} record every tick using the midpoint-angle
 %%% approximation (Euler with heading averaged over the tick).
-%%%
-%%% When Yaw_Override is a float (deg), it is used directly instead of the
-%%% wheel-derived heading increment — this lets mag_filter inject a corrected
-%%% heading without changing the caller's structure.
 %%%
 %%% Called every tick regardless of trajectory lifecycle so the pose
 %%% continues to track reality during paused/idle/finished states.
 %%% ═══════════════════════════════════════════════════════════════════════════
 
--export([integrate/4, config_string/0]).
+-export([integrate/3, config_string/0]).
 -include("robot_types.hrl").
 
 -define(WHEEL_BASE, 18.5).   %% cm, left-to-right distance between contact patches
 
 %% Speed_L, Speed_R in cm/s; Dt in s.
-%% Yaw_Override: float (deg) to use as new theta directly, or undefined to integrate from wheels.
--spec integrate({float(), float()}, float(), #pose{}, float() | undefined) -> #pose{}.
-integrate({Speed_L, Speed_R}, Dt, Pose, Yaw_Override) ->
+-spec integrate({float(), float()}, float(), #pose{}) -> #pose{}.
+integrate({Speed_L, Speed_R}, Dt, Pose) ->
     #pose{x = X, y = Y, theta = Theta} = Pose,
     Speed = (Speed_L + Speed_R) / 2.0,
     D_Dist = Speed * Dt,
 
-    Theta_New = case Yaw_Override of
-        undefined ->
-            D_Theta_Rad = ((Speed_R - Speed_L) / ?WHEEL_BASE) * Dt,
-            D_Theta_Deg = D_Theta_Rad * 180.0 / math:pi(),
-            norm_angle(Theta + D_Theta_Deg);
-        Fused_Deg ->
-            norm_angle(Fused_Deg)
-    end,
+    D_Theta_Rad = ((Speed_R - Speed_L) / ?WHEEL_BASE) * Dt,
+    D_Theta_Deg = D_Theta_Rad * 180.0 / math:pi(),
+    Theta_New = norm_angle(Theta + D_Theta_Deg),
 
     %% Midpoint heading for position integration reduces error vs. using start heading.
     Theta_Mid_Rad = ((Theta + Theta_New) / 2.0) * math:pi() / 180.0,

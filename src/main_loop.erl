@@ -4,15 +4,15 @@
 %%% Main robot control loop — orchestrator.
 %%%
 %%% Owns:
-%%%   • Pose (#pose{}) — updated every tick via odometry:integrate/4.
+%%%   • Pose (#pose{}) — updated every tick via odometry:integrate/3.
 %%%   • Trajectory lifecycle state machine (idle/running/paused/finished).
 %%%   • Button edge/hold detection and cooldown timers.
 %%%   • LED display.
-%%%   • Velocity mux (trajectory vs manual vs mag-cal override).
+%%%   • Velocity mux (trajectory vs manual).
 %%%
 %%% Lifecycle state machine (owns here):
 %%%
-%%%   idle      ──(FB_Edge & cal_done|ENABLE_MAG=false, reset_cooldown_ok)──▶ running
+%%%   idle      ──(FB_Edge, reset_cooldown_ok)──▶ running
 %%%   running   ──(FB_Edge, 500 ms cooldown)──▶ paused
 %%%   running   ──(FB_Hold ≥ 500 ms)──▶ idle  (1 s reset cooldown starts)
 %%%   running   ──(Robot_Up false)──▶ idle    (fall reset)
@@ -28,15 +28,7 @@
 -include("robot_types.hrl").
 
 %% ─── Feature flags ───────────────────────────────────────────────────────────
--define(ENABLE_MAG,        true).   %% magnetometer yaw fusion; set true after cal verified
 -define(ENABLE_TRAJECTORY, true).    %% trajectory layer
-
-%% LSM9DS1 mag ODR is 10 Hz. We read at the slower ?MAG_READ_EVERY_N tick
-%% cadence (~8.6 Hz at 172 Hz loop) and run the complementary filter on the
-%% same cadence — one tick produces both the fresh compass value and the
-%% drift-correction pull. Between mag-read ticks yaw_fused tracks the wheels
-%% via mag_filter's prediction step.
--define(MAG_READ_EVERY_N, 20).
 
 %% ─── Angles & velocity limits ────────────────────────────────────────────────
 -define(RAD_TO_DEG, 180.0/math:pi()).
@@ -73,15 +65,6 @@
     traj_counter        = 0         :: non_neg_integer(),
 
     traj                = undefined :: term(),
-    mag                 = undefined :: term(),
-    mag_cal             = undefined :: term(),
-
-    %% Mag SPI-read decimation (every ?MAG_READ_EVERY_N ticks).
-    mag_read_div        = 0         :: non_neg_integer(),
-
-    %% Trajectory start is deferred from FB_Edge to the next mag-read tick
-    %% so set_offset latches a guaranteed-fresh mag_compass reference.
-    traj_armed          = false     :: boolean(),
 
     robot_state         = rest      :: atom(),
     robot_up            = false     :: boolean()
@@ -102,7 +85,7 @@ robot_init(Hera_pid) ->
     led_control:accel_calibrating(),
     [_Gx0, Gy0, _Gz0] = calibrate(),
     io:format("[Robot] Done calibrating~n"),
-    led_control:accel_done(),
+    led_control:idle(),
 
     X0     = mat:matrix([[0], [0]]),
     P0     = mat:matrix([[0.1, 0], [0, 0.1]]),
@@ -113,7 +96,7 @@ robot_init(Hera_pid) ->
     io:format("[Robot] Pid speed=~p  stability=~p~n", [Pid_Speed, Pid_Stability]),
     io:format("[Robot] Starting robot.~n"),
 
-    RS = #rstate{mag = mag_filter:init(), mag_cal = magnetometer:init()},
+    RS = #rstate{},
 
     robot_main(T0, Hera_pid, {T0, X0, P0}, I2Cbus,
                {0, T0, []},
@@ -143,12 +126,8 @@ robot_main(Start_Time, Hera_pid,
     Now   = erlang:system_time(millisecond),
 
     %%─── 2. IMU ──────────────────────────────────────────────────────────────
-    %% Magnetometer SPI read is deferred to step 7, gated on Need_Mag.
-    %% Ay_chip is read in addition to Ax/Az so magnetometer:read/2 has the
-    %% full gravity vector for tilt-compensated heading. Balance code still
-    %% uses Ax/Az only (single-axis pitch — robot only tips fwd/back).
-    [Gy, Ax, Ay_chip, Az] = pmod_nav:read(acc,
-        [out_y_g, out_x_xl, out_y_xl, out_z_xl], #{g_unit => dps}),
+    [Gy, Ax, Az] = pmod_nav:read(acc,
+        [out_y_g, out_x_xl, out_z_xl], #{g_unit => dps}),
 
     %%─── 3. ESP32 ────────────────────────────────────────────────────────────
     [<<SL1,SL2,SR1,SR2,CtrlByte>>] = grisp_i2c:transfer(I2Cbus, [{read, 16#40, 1, 5}]),
@@ -164,15 +143,7 @@ robot_main(Start_Time, Hera_pid,
     %% Behavior preserved: select_angle(Switch, ...) used Angle_Kalman (just
     %% computed) when Switch=true, and Angle_Complem (previous tick, 1-tick lag)
     %% when Switch=false. We replicate exactly that.
-    %% atan2(-Az, abs(Ax)) — bit-identical to the original
-    %% atan(Az / -Ax) everywhere except at the singularity Ax = 0 (robot
-    %% lying on its side during hand-tumble mag cal), where the original
-    %% divides by zero. abs(Ax) keeps atan2 in the (-90°, +90°) range
-    %% matching atan's output; the leading -Az preserves the original sign
-    %% convention (forward tilt → positive Angle). Using plain atan2(Az,-Ax)
-    %% would flip the upright reading to ±180° because Ax > 0 at upright on
-    %% this chip mounting.
-    Angle_Acc_Val = math:atan2(-Az, abs(Ax)) * ?RAD_TO_DEG,
+    Angle_Acc_Val = math:atan(Az /(-Ax)) * ?RAD_TO_DEG,
     {X1, P1, Angle_Kalman, Angle_Complem_New, Angle_Rate_New, Angle} =
         case Switch of
             true ->
@@ -202,7 +173,6 @@ robot_main(Start_Time, Hera_pid,
     Prev_LR  = RS#rstate.prev_lr_combo,
 
     FB_Edge  = input_combo:rising_edge(FB_Combo, Prev_FB),
-    LR_Edge  = input_combo:rising_edge(LR_Combo, Prev_LR),
 
     FB_Base  = input_combo:hold_check(FB_Combo, Prev_FB, RS#rstate.fb_held_ms),
     FB_Held  = if FB_Combo -> FB_Base + Dt_ms; true -> 0 end,
@@ -211,100 +181,26 @@ robot_main(Start_Time, Hera_pid,
 
     FB_Hold_500 = FB_Held >= ?TRAJ_HOLD_MS,
 
-    %%─── 7. Mag pipeline — hardware (magnetometer) + fusion (mag_filter) ─────
-    %% Two-module split: magnetometer:read/1 does the SPI read + hard/soft-iron
-    %% correction and returns compass heading in degrees; magnetometer:calibrate/3
-    %% advances the cal sub-FSM one tick. mag_filter:step/2 then runs the
-    %% complementary filter on the heading.
-    %%
-    %% With ?ENABLE_MAG set, mag stays "always on": reads happen every
-    %% ?MAG_READ_EVERY_N ticks regardless of lifecycle. Cal_Active, LR_Edge
-    %% and FB_Edge are kept as bypasses for the ?ENABLE_MAG=false config (cal
-    %% still needs to run; button edges still drive lifecycle transitions).
-    Cal_Status_Prev = magnetometer:cal_status(RS#rstate.mag_cal),
-    Cal_Active      = (Cal_Status_Prev =:= settling)
-                      orelse (Cal_Status_Prev =:= spinning),
-    Need_Mag        = ?ENABLE_MAG
-                      orelse Cal_Active
-                      orelse LR_Edge
-                      orelse FB_Edge,
-    Do_Mag_Read = (RS#rstate.mag_read_div rem ?MAG_READ_EVERY_N) == 0,
-
-    %% Robot-frame accel triple for magnetometer (forward, right, up).
-    %% Chip mounting: chip-X up, chip-Y right, chip-Z rear.
-    Accel_Body = {-Az, Ay_chip, Ax},
-
-    %% Hardware read — only on the Mag-read cadence. On other ticks the cached
-    %% heading from magnetometer state is used (read returns it via the
-    %% last_heading accessor).
-    {Heading, MagCal1} =
-        case Need_Mag andalso Do_Mag_Read of
-            true  -> magnetometer:read(RS#rstate.mag_cal, Accel_Body);
-            false -> {magnetometer:last_heading(RS#rstate.mag_cal),
-                      RS#rstate.mag_cal}
-        end,
-
-    %% Cal sub-FSM — tick every loop (timer transitions need it). Range
-    %% accumulation is idempotent on cached mx_last/my_last between reads.
-    {MagCal2, CalOut} = magnetometer:calibrate(
-        #{lr_edge => LR_Edge, robot_up => Robot_Up_New,
-          do_mag_read => Do_Mag_Read, accel => Accel_Body},
-        MagCal1, Now),
-
-    %% Fusion — only when Need_Mag (skipped when ENABLE_MAG=false AND no
-    %% active cal AND no button edge).
-    {MagOut, MagState1} =
-        case Need_Mag of
-            true ->
-                MagIn = #{mag_compass => Heading,
-                          cal_status  => maps:get(cal_status, CalOut),
-                          override    => maps:get(override,   CalOut),
-                          speed_l     => Speed_L, speed_r => Speed_R,
-                          dt          => Dt,
-                          do_mag_read => Do_Mag_Read},
-                mag_filter:step(MagIn, RS#rstate.mag);
-            false ->
-                {dormant_mag_output(maps:get(cal_status, CalOut)),
-                 RS#rstate.mag}
-        end,
-
-    %% Print the canonical compass value on every mag-read tick — but suppress
-    %% during cal-spin (the spin sweeps the mag through every direction and
-    %% the readings are meaningless until cal completes). The cal DONE log
-    %% line emits the final post-cal compass value as its own one-shot print.
-    case Need_Mag andalso Do_Mag_Read andalso (not Cal_Active) of
-        true  -> io:format("[Mag] compass=~.2f deg~n", [Heading]);
-        false -> ok
-    end,
-    #{yaw_fused  := Yaw_Fused,
-      yaw_odo    := Yaw_Odo,
-      yaw_mag    := Yaw_Mag,
-      cal_status := Cal_Status,
-      override   := MagOverride} = MagOut,
-
-    %%─── 8. Odometry (running only) ──────────────────────────────────────────
+    %%─── 7. Odometry (running only) ──────────────────────────────────────────
     %% Pose output is only consumed by traj_planner and csv_logger, both gated
     %% on lifecycle=running. lifecycle_step resets pose to zero on idle→running,
     %% so skipping integration outside running is safe.
-    Yaw_Override = case ?ENABLE_MAG of true -> Yaw_Fused; false -> undefined end,
     Pose1 = case RS#rstate.lifecycle of
-        running -> odometry:integrate({Speed_L, Speed_R}, Dt, RS#rstate.pose, Yaw_Override);
+        running -> odometry:integrate({Speed_L, Speed_R}, Dt, RS#rstate.pose);
         _       -> RS#rstate.pose
     end,
 
-    %%─── 9. Lifecycle state machine ──────────────────────────────────────────
+    %%─── 8. Lifecycle state machine ──────────────────────────────────────────
     RS1 = RS#rstate{
         pose          = Pose1,
-        mag           = MagState1,
-        mag_cal       = MagCal2,
         robot_up      = Robot_Up_New,
         fb_held_ms    = FB_Held,
         lr_held_ms    = LR_Held,
         prev_fb_combo = FB_Combo,
         prev_lr_combo = LR_Combo
     },
-    {LC_New, TrajState1, Pose2, MagState2, RS2} =
-        lifecycle_step(RS1, FB_Edge, FB_Hold_500, Cal_Status, Do_Mag_Read, Now),
+    {LC_New, TrajState1, Pose2, RS2} =
+        lifecycle_step(RS1, FB_Edge, FB_Hold_500, Now),
 
     %%─── 10. Trajectory controller (only when running) ───────────────────────
     {Adv_V_Traj, Turn_V_Traj, TrajFinished, WpsLeft, TrajSS, TrajCnt, TrajDistWP, TrajState2} =
@@ -324,28 +220,22 @@ robot_main(Start_Time, Hera_pid,
         end,
 
     %% Transition to finished if traj_planner signals completion.
-    {LC_Final, MagState3} =
+    LC_Final =
         if TrajFinished andalso LC_New =:= running ->
                io:format("===LOG_END_TRAJ===~n"),
-               MagS3 = mag_filter:reset_yaw_accumulator(MagState2),
-               {finished, MagS3};
+               finished;
            true ->
-               {LC_New, MagState2}
+               LC_New
         end,
 
     %%─── 11. Velocity mux ────────────────────────────────────────────────────
+    Man_Adv  = speed_ref(Forward, Backward),
+    Man_Turn = turn_ref(Left, Right),
     {Adv_V_Goal, Turn_V_Goal} =
-        case MagOverride of
-            {CalAdv, CalTurn} ->
-                {CalAdv, CalTurn};
-            undefined ->
-                Man_Adv  = speed_ref(Forward, Backward),
-                Man_Turn = turn_ref(Left, Right),
-                case LC_Final of
-                    running -> {Adv_V_Traj + Man_Adv, Turn_V_Traj + Man_Turn};
-                    paused  -> {Man_Adv,               Man_Turn};
-                    _       -> {Man_Adv,               Man_Turn}
-                end
+        case LC_Final of
+            running -> {Adv_V_Traj + Man_Adv, Turn_V_Traj + Man_Turn};
+            paused  -> {Man_Adv,               Man_Turn};
+            _       -> {Man_Adv,               Man_Turn}
         end,
 
     %%─── 12. Stability controller ────────────────────────────────────────────
@@ -359,7 +249,7 @@ robot_main(Start_Time, Hera_pid,
     %%─── 13. Robot_State machine ─────────────────────────────────────────────
     Next_Robot_State =
         next_robot_state(RS2#rstate.robot_state, Robot_Up_New, Get_Up,
-                         Angle, Arm_Ready, Cal_Status),
+                         Angle, Arm_Ready),
     {Power, Freeze, Extend, Robot_Up_Bit} = state_outputs(Next_Robot_State),
 
     %%─── 14. ESP32 output ────────────────────────────────────────────────────
@@ -369,13 +259,13 @@ robot_main(Start_Time, Hera_pid,
     grisp_i2c:transfer(I2Cbus, [{write, 16#40, 1, [HF1, HF2, <<Output_Byte>>]}]),
 
     %%─── 15. LED ─────────────────────────────────────────────────────────────
-    update_leds(Cal_Status, LC_Final, RS2#rstate.last_reset_ms, Now),
+    update_leds(LC_Final, RS2#rstate.last_reset_ms, Now),
 
     %%─── 16. CSV logging ─────────────────────────────────────────────────────
     if LC_Final =:= running ->
            case csv_logger:append() of
                logged ->
-                   #pose{x = PX, y = PY} = Pose2,
+                   #pose{x = PX, y = PY, theta = PT} = Pose2,
                    csv_logger:emit_serial(#{t_ms       => Now,
                                             lifecycle  => LC_Final,
                                             substate   => TrajSS,
@@ -386,10 +276,7 @@ robot_main(Start_Time, Hera_pid,
                                             turn_v     => Turn_V_Goal,
                                             dist_wp    => TrajDistWP,
                                             wps_left   => WpsLeft,
-                                            yaw_odo    => Yaw_Odo,
-                                            yaw_mag    => Yaw_Mag,
-                                            yaw_fused  => Yaw_Fused,
-                                            cal_status => Cal_Status});
+                                            yaw_odo    => PT});
                skipped -> ok
            end;
        true -> ok
@@ -425,14 +312,11 @@ robot_main(Start_Time, Hera_pid,
         pose         = Pose2,
         lifecycle    = LC_Final,
         traj         = TrajState2,
-        mag          = MagState3,
-        mag_cal      = MagCal2,
         robot_state  = Next_Robot_State,
         robot_up     = Robot_Up_New,
         traj_wps_left = WpsLeft,
         traj_substate = TrajSS,
-        traj_counter  = TrajCnt,
-        mag_read_div = RS#rstate.mag_read_div + 1
+        traj_counter  = TrajCnt
     },
     robot_main(Start_Time, Hera_pid,
                {T1, X1, P1}, I2Cbus,
@@ -447,114 +331,79 @@ robot_main(Start_Time, Hera_pid,
 %%% Lifecycle state machine
 %%% ═══════════════════════════════════════════════════════════════════════════
 
-lifecycle_step(RS, FB_Edge, FB_Hold_500, _Cal_Status, Do_Mag_Read, Now) ->
+lifecycle_step(RS, FB_Edge, FB_Hold_500, Now) ->
     LC    = RS#rstate.lifecycle,
     RobUp = RS#rstate.robot_up,
     TS    = RS#rstate.traj,
-    MS    = RS#rstate.mag,
 
     Traj_OK   = (Now - RS#rstate.last_traj_action_ms) >= ?TRAJ_PAUSE_COOLDOWN_MS,
     Reset_OK  = (Now - RS#rstate.last_reset_ms)       >= ?TRAJ_RESET_COOLDOWN_MS,
-    %% Cal_OK = true: the #mag_cal{} defaults (x_off/y_off/z_off) are bench-
-    %% tuned baselines from prior cal runs on this robot — accurate enough to
-    %% drive trajectory immediately. L+R re-cal stays available on demand for
-    %% a new environment or hardware change.
-    Cal_OK    = true,
 
     case LC of
         idle ->
-            %% Deferred start: FB_Edge arms; the actual transition fires on
-            %% the next mag-read tick so set_offset latches a fresh mag_compass.
-            %% If FB_Edge happens to land on a mag-read tick directly, we fire
-            %% on this same tick.
-            Want_Start = (FB_Edge orelse RS#rstate.traj_armed)
-                         andalso Cal_OK andalso Reset_OK,
-            if Want_Start andalso Do_Mag_Read ->
+            if FB_Edge andalso Reset_OK ->
                    TS2 = traj_planner:init(),
-                   MS2 = mag_filter:set_offset(MS),
                    csv_logger:reset(),
                    RS2 = RS#rstate{lifecycle            = running,
                                    lifecycle_entered_ms = Now,
                                    last_traj_action_ms  = Now,
-                                   traj_armed = false,
-                                   traj = TS2, mag = MS2, pose = #pose{}},
-                   {running, TS2, RS2#rstate.pose, MS2, RS2};
-               Want_Start ->
-                   %% Arm and wait for the next mag-read tick.
-                   {idle, TS, RS#rstate.pose, MS,
-                    RS#rstate{traj_armed = true}};
+                                   traj = TS2, pose = #pose{}},
+                   {running, TS2, RS2#rstate.pose, RS2};
                true ->
-                   {idle, TS, RS#rstate.pose, MS, RS}
+                   {idle, TS, RS#rstate.pose, RS}
             end;
 
         running ->
             if not RobUp ->
-                   MS2 = mag_filter:reset_yaw_accumulator(MS),
                    RS2 = RS#rstate{lifecycle = idle, traj = undefined,
-                                   traj_armed = false,
-                                   mag = MS2, last_reset_ms = Now},
-                   {idle, undefined, RS2#rstate.pose, MS2, RS2};
+                                   last_reset_ms = Now},
+                   {idle, undefined, RS2#rstate.pose, RS2};
                FB_Hold_500 ->
-                   MS2 = mag_filter:reset_yaw_accumulator(MS),
                    RS2 = RS#rstate{lifecycle = idle, traj = undefined,
-                                   traj_armed = false,
-                                   mag = MS2, last_reset_ms = Now},
-                   {idle, undefined, RS2#rstate.pose, MS2, RS2};
+                                   last_reset_ms = Now},
+                   {idle, undefined, RS2#rstate.pose, RS2};
                FB_Edge andalso Traj_OK ->
                    RS2 = RS#rstate{lifecycle            = paused,
                                    lifecycle_entered_ms = Now,
                                    last_traj_action_ms  = Now},
-                   {paused, TS, RS2#rstate.pose, MS, RS2};
+                   {paused, TS, RS2#rstate.pose, RS2};
                true ->
-                   {running, TS, RS#rstate.pose, MS, RS}
+                   {running, TS, RS#rstate.pose, RS}
             end;
 
         paused ->
             if not RobUp ->
-                   MS2 = mag_filter:reset_yaw_accumulator(MS),
                    RS2 = RS#rstate{lifecycle = idle, traj = undefined,
-                                   traj_armed = false,
-                                   mag = MS2, last_reset_ms = Now},
-                   {idle, undefined, RS2#rstate.pose, MS2, RS2};
+                                   last_reset_ms = Now},
+                   {idle, undefined, RS2#rstate.pose, RS2};
                FB_Hold_500 ->
-                   MS2 = mag_filter:reset_yaw_accumulator(MS),
                    RS2 = RS#rstate{lifecycle = idle, traj = undefined,
-                                   traj_armed = false,
-                                   mag = MS2, last_reset_ms = Now},
-                   {idle, undefined, RS2#rstate.pose, MS2, RS2};
+                                   last_reset_ms = Now},
+                   {idle, undefined, RS2#rstate.pose, RS2};
                FB_Edge andalso Traj_OK ->
                    RS2 = RS#rstate{lifecycle            = running,
                                    lifecycle_entered_ms = Now,
                                    last_traj_action_ms  = Now},
-                   {running, TS, RS2#rstate.pose, MS, RS2};
+                   {running, TS, RS2#rstate.pose, RS2};
                true ->
-                   {paused, TS, RS#rstate.pose, MS, RS}
+                   {paused, TS, RS#rstate.pose, RS}
             end;
 
         finished ->
-            %% Same deferred-start pattern as idle: FB_Edge arms, mag-read
-            %% tick fires the transition.
-            Want_Restart = (FB_Edge orelse RS#rstate.traj_armed),
             if FB_Hold_500 ->
                    RS2 = RS#rstate{lifecycle = idle, traj = undefined,
-                                   traj_armed = false,
                                    last_reset_ms = Now},
-                   {idle, undefined, RS2#rstate.pose, MS, RS2};
-               Want_Restart andalso Do_Mag_Read ->
+                   {idle, undefined, RS2#rstate.pose, RS2};
+               FB_Edge ->
                    TS2 = traj_planner:init(),
-                   MS2 = mag_filter:set_offset(MS),
                    csv_logger:reset(),
                    RS2 = RS#rstate{lifecycle            = running,
                                    lifecycle_entered_ms = Now,
                                    last_traj_action_ms  = Now,
-                                   traj_armed = false,
-                                   traj = TS2, mag = MS2, pose = #pose{}},
-                   {running, TS2, RS2#rstate.pose, MS2, RS2};
-               Want_Restart ->
-                   {finished, TS, RS#rstate.pose, MS,
-                    RS#rstate{traj_armed = true}};
+                                   traj = TS2, pose = #pose{}},
+                   {running, TS2, RS2#rstate.pose, RS2};
                true ->
-                   {finished, TS, RS#rstate.pose, MS, RS}
+                   {finished, TS, RS#rstate.pose, RS}
             end
     end.
 
@@ -562,38 +411,21 @@ lifecycle_step(RS, FB_Edge, FB_Hold_500, _Cal_Status, Do_Mag_Read, Now) ->
 %%% LED display
 %%% ═══════════════════════════════════════════════════════════════════════════
 
-update_leds(Cal_Status, Lifecycle, Last_Reset_Ms, Now) ->
-    %% With ?ENABLE_MAG=false, the cal sub-FSM never runs, so Cal_Status stays
-    %% at not_cal. Treat it as done so LEDs follow the lifecycle directly.
-    Effective = case ?ENABLE_MAG of
-        false -> done;
-        true  -> Cal_Status
-    end,
+update_leds(Lifecycle, Last_Reset_Ms, Now) ->
     In_Cooldown = (Now - Last_Reset_Ms) < ?TRAJ_RESET_COOLDOWN_MS,
-    case Effective of
-        not_cal  -> led_control:accel_done();
-        settling -> led_control:cal_settling();
-        spinning -> led_control:cal_spinning();
-        failed   -> led_control:cal_failed();
-        done     ->
-            if In_Cooldown ->
-                   led_control:traj_reset_cooldown();
-               true ->
-                   case Lifecycle of
-                       idle     -> led_control:cal_done();
-                       running  -> led_control:traj_running();
-                       paused   -> led_control:traj_paused();
-                       finished -> led_control:traj_finished()
-                   end
-            end
+    case Lifecycle of
+        idle when In_Cooldown -> led_control:traj_reset_cooldown();
+        idle     -> led_control:idle();
+        running  -> led_control:traj_running();
+        paused   -> led_control:traj_paused();
+        finished -> led_control:traj_finished()
     end.
 
 %%% ═══════════════════════════════════════════════════════════════════════════
 %%% Robot state machine (unchanged from original)
 %%% ═══════════════════════════════════════════════════════════════════════════
 
-next_robot_state(Robot_State, Robot_Up, Get_Up, Angle, Arm_Ready, Cal_Status) ->
-    Cal_In_Progress = (Cal_Status =:= settling) orelse (Cal_Status =:= spinning),
+next_robot_state(Robot_State, Robot_Up, Get_Up, Angle, Arm_Ready) ->
     case Robot_State of
         rest ->
             if Get_Up -> raising; true -> rest end;
@@ -603,9 +435,9 @@ next_robot_state(Robot_State, Robot_Up, Get_Up, Angle, Arm_Ready, Cal_Status) ->
                true       -> raising
             end;
         stand_up ->
-            if not Get_Up andalso not Cal_In_Progress -> wait_for_extend;
-               not Robot_Up                           -> rest;
-               true                                   -> stand_up
+            if not Get_Up -> wait_for_extend;
+               not Robot_Up -> rest;
+               true        -> stand_up
             end;
         wait_for_extend ->
             prepare_arms;
@@ -656,25 +488,14 @@ kalman_angle(Dt, Ax, Az, Gy, Gy0, X0, P0) ->
     Jf = fun(X) -> [_,_]  = mat:to_array(X), mat:matrix([[1,Dt],[0,1]]) end,
     H  = fun(X) -> [Th,W] = mat:to_array(X), mat:matrix([[Th],[W]])     end,
     Jh = fun(X) -> [_,_]  = mat:to_array(X), mat:matrix([[1,0],[0,1]])  end,
-    Z  = mat:matrix([[math:atan2(-Az, abs(Ax))], [(Gy - Gy0) * ?DEG_TO_RAD]]),
+    Z  = mat:matrix([[math:atan(Az / (-Ax))], [(Gy - Gy0) * ?DEG_TO_RAD]]),
     kalman:ekf({X0, P0}, {F, Jf}, {H, Jh}, Q, R, Z).
 
 complem_angle({Dt, Ax, Az, Gy, Gy0, K, Angle_Complem, Angle_Rate}) ->
     Rate_New  = (Gy - Gy0) * ?COEF_FILTER + Angle_Rate * (1 - ?COEF_FILTER),
     Delta_Gyr = Rate_New * Dt,
-    Angle_Acc = math:atan2(-Az, abs(Ax)) * 180 / math:pi(),
+    Angle_Acc = math:atan(Az / (-Ax)) * 180 / math:pi(),
     {(Angle_Complem + Delta_Gyr) * K + Angle_Acc * (1 - K), Rate_New}.
-
-%% Returned by the mag block when Need_Mag is false. cal_status is preserved
-%% so the LED display continues to reflect the cal sub-FSM correctly when it
-%% wakes up again on the next L+R press.
-dormant_mag_output(Cal_Status) ->
-    #{yaw_fused   => 0.0,
-      yaw_mag_raw => 0.0,
-      yaw_odo     => 0.0,
-      yaw_mag     => 0.0,
-      cal_status  => Cal_Status,
-      override    => undefined}.
 
 speed_ref(Forward, Backward) ->
     if Forward andalso Backward -> 0.0;   %% combo gesture — not a direction
@@ -699,7 +520,7 @@ handle_hera_logging(Hera_pid, Logging, Logging_New) ->
     if not Logging andalso Logging_New ->
            Hera_pid ! {self(), start_log};
        Logging andalso not Logging_New ->
-           led_control:accel_done(),
+           led_control:idle(),
            Hera_pid ! {self(), stop_log};
        true -> ok
     end.
