@@ -67,7 +67,11 @@
     traj                = undefined :: term(),
 
     robot_state         = rest      :: atom(),
-    robot_up            = false     :: boolean()
+    robot_up            = false     :: boolean(),
+
+    %% Gyro-integrated yaw (deg, normalized [-180,180]). Log-only.
+    %% Reset to 0.0 on idle→running and finished→running, alongside pose.
+    yaw_gyro            = 0.0       :: float()
 }).
 
 %%% ═══════════════════════════════════════════════════════════════════════════
@@ -83,7 +87,8 @@ robot_init(Hera_pid) ->
 
     io:format("[Robot] Calibrating... Do not move the pmod_nav!~n"),
     led_control:accel_calibrating(),
-    [_Gx0, Gy0, _Gz0] = calibrate(),
+    [Gx0, Gy0, _Gz0] = calibrate(),
+    io:format("[Robot] Gyro bias: Gx0=~.4f Gy0=~.4f dps~n", [Gx0, Gy0]),
     io:format("[Robot] Done calibrating~n"),
     led_control:idle(),
 
@@ -100,7 +105,7 @@ robot_init(Hera_pid) ->
 
     robot_main(T0, Hera_pid, {T0, X0, P0}, I2Cbus,
                {0, T0, []},
-               {Gy0, 0.0, 0.0},
+               {Gy0, Gx0, 0.0, 0.0},
                {Pid_Speed, Pid_Stability},
                {0.0, 0.0},
                {0, 0, 200.0, T0},
@@ -113,7 +118,7 @@ robot_init(Hera_pid) ->
 robot_main(Start_Time, Hera_pid,
            {T0, X0, P0}, I2Cbus,
            {Logging, Log_End, Log_List},
-           {Gy0, Angle_Complem, Angle_Rate},
+           {Gy0, Gx0, Angle_Complem, Angle_Rate},
            {Pid_Speed, Pid_Stability},
            {Adv_V_Ref, Turn_V_Ref},
            {N, Freq, Mean_Freq, T_End},
@@ -126,8 +131,9 @@ robot_main(Start_Time, Hera_pid,
     Now   = erlang:system_time(millisecond),
 
     %%─── 2. IMU ──────────────────────────────────────────────────────────────
-    [Gy, Ax, Az] = pmod_nav:read(acc,
-        [out_y_g, out_x_xl, out_z_xl], #{g_unit => dps}),
+    %% Gx (out_x_g) is the yaw-rate axis (up = +X). Log-only via gyro_yaw.
+    [Gy, Gx, Ax, Az] = pmod_nav:read(acc,
+        [out_y_g, out_x_g, out_x_xl, out_z_xl], #{g_unit => dps}),
 
     %%─── 3. ESP32 ────────────────────────────────────────────────────────────
     [<<SL1,SL2,SR1,SR2,CtrlByte>>] = grisp_i2c:transfer(I2Cbus, [{read, 16#40, 1, 5}]),
@@ -190,9 +196,18 @@ robot_main(Start_Time, Hera_pid,
         _       -> RS#rstate.pose
     end,
 
+    %%─── 7b. Gyro yaw (running only, log-only) ───────────────────────────────
+    %% Same gating as odometry; lifecycle_step resets yaw_gyro on entry to
+    %% running so it shares an origin with pose.theta for visual comparison.
+    {Yaw_Gyro_1, Gx_Corr} = case RS#rstate.lifecycle of
+        running -> gyro_yaw:step(RS#rstate.yaw_gyro, Gx, Gx0, Angle, Dt);
+        _       -> {RS#rstate.yaw_gyro, Gx - Gx0}
+    end,
+
     %%─── 8. Lifecycle state machine ──────────────────────────────────────────
     RS1 = RS#rstate{
         pose          = Pose1,
+        yaw_gyro      = Yaw_Gyro_1,
         robot_up      = Robot_Up_New,
         fb_held_ms    = FB_Held,
         lr_held_ms    = LR_Held,
@@ -276,7 +291,9 @@ robot_main(Start_Time, Hera_pid,
                                             turn_v     => Turn_V_Goal,
                                             dist_wp    => TrajDistWP,
                                             wps_left   => WpsLeft,
-                                            yaw_odo    => PT});
+                                            yaw_odo    => PT,
+                                            yaw_gyro   => RS2#rstate.yaw_gyro,
+                                            gx_dps     => Gx_Corr});
                skipped -> ok
            end;
        true -> ok
@@ -321,7 +338,7 @@ robot_main(Start_Time, Hera_pid,
     robot_main(Start_Time, Hera_pid,
                {T1, X1, P1}, I2Cbus,
                {Logging_New, Log_End_New, Log_List_New},
-               {Gy0, Angle_Complem_New, Angle_Rate_New},
+               {Gy0, Gx0, Angle_Complem_New, Angle_Rate_New},
                {Pid_Speed, Pid_Stability},
                {Adv_V_Ref_New, Turn_V_Ref_New},
                {N_New, Freq_New, Mean_Freq_New, T_End_New},
@@ -347,7 +364,8 @@ lifecycle_step(RS, FB_Edge, FB_Hold_500, Now) ->
                    RS2 = RS#rstate{lifecycle            = running,
                                    lifecycle_entered_ms = Now,
                                    last_traj_action_ms  = Now,
-                                   traj = TS2, pose = #pose{}},
+                                   traj = TS2, pose = #pose{},
+                                   yaw_gyro = gyro_yaw:reset()},
                    {running, TS2, RS2#rstate.pose, RS2};
                true ->
                    {idle, TS, RS#rstate.pose, RS}
@@ -400,7 +418,8 @@ lifecycle_step(RS, FB_Edge, FB_Hold_500, Now) ->
                    RS2 = RS#rstate{lifecycle            = running,
                                    lifecycle_entered_ms = Now,
                                    last_traj_action_ms  = Now,
-                                   traj = TS2, pose = #pose{}},
+                                   traj = TS2, pose = #pose{},
+                                   yaw_gyro = gyro_yaw:reset()},
                    {running, TS2, RS2#rstate.pose, RS2};
                true ->
                    {finished, TS, RS#rstate.pose, RS}

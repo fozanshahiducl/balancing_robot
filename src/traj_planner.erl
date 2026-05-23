@@ -27,12 +27,12 @@
 -define(WHEEL_BASE,       18.5).   %% cm
 
 %% ─── Speed ───────────────────────────────────────────────────────────────────
--define(MAX_SPEED,         5.0).   %% cm/s — straight-line cruise speed
+-define(MAX_SPEED,         10.0).   %% cm/s — straight-line cruise speed
 -define(MIN_CORNER_SPEED,  1.0).   %% cm/s — floor when curvature is high
 -define(MAX_TURN_V,       18.0).   %% cm/s — cap on differential turn velocity
 
 %% ─── Ramps (asymmetric: slow accel, crisp brake) ─────────────────────────────
--define(ACCEL_RATE,        4.0).   %% cm/s²
+-define(ACCEL_RATE,        8.0).   %% cm/s²
 -define(BRAKE_RATE,       15.0).   %% cm/s²
 -define(TURN_ACCEL_RATE,  15.0).   %% cm/s²
 -define(TURN_BRAKE_RATE,  25.0).   %% cm/s²
@@ -41,7 +41,7 @@
 -define(LOOKAHEAD,         8.0).   %% cm
 
 %% ─── Waypoint stop logic ─────────────────────────────────────────────────────
--define(BRAKE_DIST,        4.0).   %% cm — begin braking this far from waypoint
+-define(BRAKE_DIST,        6.0).   %% cm — begin braking this far from waypoint
 -define(WAYPOINT_REACHED,  4.0).   %% cm — close-enough radius to declare arrival
 -define(SETTLE_VEL,        1.0).   %% cm/s — speed below this = considered stopped
 -define(DWELL_TICKS,     600).     %% ~2 s at 300 Hz
@@ -54,10 +54,13 @@
 %% First point must equal the robot's zeroed launch pose (0,0).
 -define(WAYPOINTS, [
     {  0.0,   0.0},
-    {  50.0,  0.0},
-    { 50.0,  -50.0},
-    {  0.0,  -50.0},
-    {  0.0,   0.0}
+    {  35.0,  0.0},
+    {  5.0,   0.0},
+    {  100.0,  -25.0},
+    {  150.0,  25.0},
+    {  200.0,  -25.0},
+    {  250.0,   25.0},
+    {  300.0,  0.0}
 ]).
 
 -record(traj_state, {
