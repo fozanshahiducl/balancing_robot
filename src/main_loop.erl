@@ -45,6 +45,22 @@
 %% ─── Legacy logging ──────────────────────────────────────────────────────────
 -define(LOG_DURATION, 15000).
 
+%% wp injection fsm - phase 2 just prints + leds, no traj stuff yet
+-record(cmd_rx, {
+    state               = idle :: idle
+                                | want_x_hi  | want_x_lo  | want_x_to_y
+                                | want_y_hi  | want_y_lo  | want_commit
+                                | want_n     | want_n_commit,
+    x_acc               = 0    :: 0..1023,
+    y_acc               = 0    :: 0..1023,
+    n_acc               = 0    :: 0..31,
+    last_byte           = -1   :: integer(),   %% raw byt last seen
+    stable_count        = 0    :: non_neg_integer(),
+    last_committed_byte = -1   :: integer(),   %% byt we already accepted, ignore til it changes
+    led_pulse_kind      = none :: none | cmd_frame_ok | cmd_committed | cmd_error,
+    led_pulse_left      = 0    :: non_neg_integer()
+}).
+
 %% ─── Main state record ────────────────────────────────────────────────────────
 -record(rstate, {
     pose                = #pose{}   :: #pose{},
@@ -67,7 +83,9 @@
     traj                = undefined :: term(),
 
     robot_state         = rest      :: atom(),
-    robot_up            = false     :: boolean()
+    robot_up            = false     :: boolean(),
+
+    cmd_rx              = #cmd_rx{} :: #cmd_rx{}
 }).
 
 %%% ═══════════════════════════════════════════════════════════════════════════
@@ -137,6 +155,12 @@ robot_main(Start_Time, Hera_pid,
     [Arm_Ready, Switch, Test, Get_Up, Forward, Backward, Left, Right] =
         hera_com:get_bits(CtrlByte),
 
+    %%─── 3b. wp inject fsm (phase 2: prints + leds only) ────────────────────
+    %% b6=1 -> protocol byt, else its just normal drive
+    %% runs regardless of lifecycle so op can q waypoints anytime
+    %% drive lockout + traj wiring comes later (phases 4-5)
+    CmdRx1 = cmd_rx_step(CtrlByte, RS#rstate.cmd_rx),
+
     %%─── 4. Tilt — only the filter selected by Switch runs ───────────────────
     %% Original code ran both Kalman and complementary every tick and discarded
     %% one via select_angle. Each Kalman pass allocates ~7 mat:matrix structs
@@ -198,7 +222,8 @@ robot_main(Start_Time, Hera_pid,
         fb_held_ms    = FB_Held,
         lr_held_ms    = LR_Held,
         prev_fb_combo = FB_Combo,
-        prev_lr_combo = LR_Combo
+        prev_lr_combo = LR_Combo,
+        cmd_rx        = CmdRx1
     },
     {LC_New, TrajState1, Pose2, RS2} =
         lifecycle_step(RS1, FB_Edge, FB_Hold_500, Now),
@@ -260,7 +285,7 @@ robot_main(Start_Time, Hera_pid,
     grisp_i2c:transfer(I2Cbus, [{write, 16#40, 1, [HF1, HF2, <<Output_Byte>>]}]),
 
     %%─── 15. LED ─────────────────────────────────────────────────────────────
-    update_leds(LC_Final, RS2#rstate.last_reset_ms, Now),
+    update_leds(LC_Final, RS2#rstate.last_reset_ms, Now, RS2#rstate.cmd_rx),
 
     %%─── 16. CSV logging ─────────────────────────────────────────────────────
     if LC_Final =:= running ->
@@ -412,7 +437,7 @@ lifecycle_step(RS, FB_Edge, FB_Hold_500, Now) ->
 %%% LED display
 %%% ═══════════════════════════════════════════════════════════════════════════
 
-update_leds(Lifecycle, Last_Reset_Ms, Now) ->
+update_leds(Lifecycle, Last_Reset_Ms, Now, CmdRx) ->
     In_Cooldown = (Now - Last_Reset_Ms) < ?TRAJ_RESET_COOLDOWN_MS,
     case Lifecycle of
         idle when In_Cooldown -> led_control:traj_reset_cooldown();
@@ -420,7 +445,20 @@ update_leds(Lifecycle, Last_Reset_Ms, Now) ->
         running  -> led_control:traj_running();
         paused   -> led_control:traj_paused();
         finished -> led_control:traj_finished()
+    end,
+    %% override led1 if cmd-rx fsm has somthing to show
+    %% led2 stays w/ lifecycle so we can see both at the same time
+    case cmd_led_override(CmdRx) of
+        none           -> ok;
+        cmd_active     -> led_control:cmd_active();
+        cmd_frame_ok   -> led_control:cmd_frame_ok();
+        cmd_committed  -> led_control:cmd_committed();
+        cmd_error      -> led_control:cmd_error()
     end.
+
+cmd_led_override(#cmd_rx{led_pulse_left = N, led_pulse_kind = K}) when N > 0, K =/= none -> K;
+cmd_led_override(#cmd_rx{state = idle}) -> none;
+cmd_led_override(#cmd_rx{}) -> cmd_active.
 
 %%% ═══════════════════════════════════════════════════════════════════════════
 %%% Robot state machine (unchanged from original)
@@ -470,6 +508,116 @@ state_outputs(State) ->
         wait_for_retract -> {1, 0, 0, 0};
         soft_fall        -> {1, 0, 0, 0}
     end.
+
+%%% 
+%%% wp ota inject fsm  (rx + print + led only)
+%%% 
+%%%
+%% each tick feeds CtrlByte to cmd_rx_step/2:
+%%   1. tick down any in-flight led pulse counter
+%%   2. count consecutive same-byt reads (debounce)
+%%   3. if fresh stable PROTO=1 byt -> run thru fsm (advance/commit/err)
+%%   4. if stable PROTO=0 byt -> drop commit gate so repeated commands
+%%      (eg cancel_last twice) get re-accepted insted of dedup'd
+%%
+%% effects rn = io:format prints + led pulse state on #cmd_rx{}
+%% no traj mutation yet, comes phases 4-5
+
+cmd_rx_step(CtrlByte, CR = #cmd_rx{}) ->
+    CR1 = tick_led_pulse(CR),
+    Stable_New =
+        if CtrlByte =:= CR1#cmd_rx.last_byte -> CR1#cmd_rx.stable_count + 1;
+           true                              -> 1
+        end,
+    CR2 = CR1#cmd_rx{last_byte = CtrlByte, stable_count = Stable_New},
+    Proto    = (CtrlByte band ?CMD_PROTO_MASK) =/= 0,
+    Stable   = Stable_New >= 2,
+    Changed  = CtrlByte =/= CR2#cmd_rx.last_committed_byte,
+    case {Proto, Stable, Changed} of
+        {true, true, true} ->
+            CR3     = CR2#cmd_rx{last_committed_byte = CtrlByte},
+            Kind    = (CtrlByte band ?CMD_KIND_MASK) =/= 0,
+            Payload = CtrlByte band ?CMD_PAYLOAD_MASK,
+            dispatch_frame(Kind, Payload, CR3);
+        {false, true, _} ->
+            %% stable drive byt - drop the gate so next proto byt counts fresh
+            CR2#cmd_rx{last_committed_byte = -1};
+        _ ->
+            CR2
+    end.
+
+%% ABORT in idle = silent noop, else reset w/ err blink
+dispatch_frame(false, ?CMD_CTRL_ABORT, CR = #cmd_rx{state = idle}) ->
+    CR;
+dispatch_frame(false, ?CMD_CTRL_ABORT, CR) ->
+    pulse(reset_cmd_rx(CR), cmd_error, ?CMD_LED_PULSE_ERROR);
+
+%% from idle a ctrl frame kicks off a transaction
+dispatch_frame(false, ?CMD_CTRL_ADD_HEADER, CR = #cmd_rx{state = idle}) ->
+    pulse(CR#cmd_rx{state = want_x_hi}, cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
+dispatch_frame(false, ?CMD_CTRL_CANCEL_LAST, CR = #cmd_rx{state = idle}) ->
+    io:format("RX_CANCEL_LAST~n"),
+    pulse(reset_cmd_rx(CR), cmd_committed, ?CMD_LED_PULSE_COMMITTED);
+dispatch_frame(false, ?CMD_CTRL_CLEAR_ALL, CR = #cmd_rx{state = idle}) ->
+    io:format("RX_CLEAR_ALL~n"),
+    pulse(reset_cmd_rx(CR), cmd_committed, ?CMD_LED_PULSE_COMMITTED);
+dispatch_frame(false, ?CMD_CTRL_CANCEL_N_HDR, CR = #cmd_rx{state = idle}) ->
+    pulse(CR#cmd_rx{state = want_n}, cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
+
+%% ADD seq: data data X_TO_Y data data ADD_COMMIT
+dispatch_frame(true, Payload, CR = #cmd_rx{state = want_x_hi}) ->
+    pulse(CR#cmd_rx{state = want_x_lo, x_acc = Payload bsl 5},
+          cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
+dispatch_frame(true, Payload, CR = #cmd_rx{state = want_x_lo}) ->
+    pulse(CR#cmd_rx{state = want_x_to_y, x_acc = CR#cmd_rx.x_acc bor Payload},
+          cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
+dispatch_frame(false, ?CMD_CTRL_X_TO_Y, CR = #cmd_rx{state = want_x_to_y}) ->
+    pulse(CR#cmd_rx{state = want_y_hi}, cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
+dispatch_frame(true, Payload, CR = #cmd_rx{state = want_y_hi}) ->
+    pulse(CR#cmd_rx{state = want_y_lo, y_acc = Payload bsl 5},
+          cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
+dispatch_frame(true, Payload, CR = #cmd_rx{state = want_y_lo}) ->
+    pulse(CR#cmd_rx{state = want_commit, y_acc = CR#cmd_rx.y_acc bor Payload},
+          cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
+dispatch_frame(false, ?CMD_CTRL_ADD_COMMIT, CR = #cmd_rx{state = want_commit}) ->
+    DX = CR#cmd_rx.x_acc - ?CMD_SIGN_OFFSET,
+    DY = CR#cmd_rx.y_acc - ?CMD_SIGN_OFFSET,
+    case in_offset_range(DX) andalso in_offset_range(DY) of
+        true ->
+            io:format("RX_WP: dx=~p dy=~p~n", [DX, DY]),
+            pulse(reset_cmd_rx(CR), cmd_committed, ?CMD_LED_PULSE_COMMITTED);
+        false ->
+            io:format("RX_WP_ERR: dx=~p dy=~p (out of range)~n", [DX, DY]),
+            pulse(reset_cmd_rx(CR), cmd_error, ?CMD_LED_PULSE_ERROR)
+    end;
+
+%% CANCEL_N seq: data, CANCEL_N_COMMIT
+dispatch_frame(true, Payload, CR = #cmd_rx{state = want_n}) ->
+    pulse(CR#cmd_rx{state = want_n_commit, n_acc = Payload},
+          cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
+dispatch_frame(false, ?CMD_CTRL_CANCEL_N_COMMIT, CR = #cmd_rx{state = want_n_commit}) ->
+    io:format("RX_CANCEL_N: ~p~n", [CR#cmd_rx.n_acc]),
+    pulse(reset_cmd_rx(CR), cmd_committed, ?CMD_LED_PULSE_COMMITTED);
+
+%% anything else in any state = proto err, reset + err blink
+dispatch_frame(_Kind, _Payload, CR) ->
+    pulse(reset_cmd_rx(CR), cmd_error, ?CMD_LED_PULSE_ERROR).
+
+reset_cmd_rx(CR) ->
+    %% keep debounce fields, just wipe fsm state + accs
+    CR#cmd_rx{state = idle, x_acc = 0, y_acc = 0, n_acc = 0}.
+
+pulse(CR, Kind, Ticks) ->
+    CR#cmd_rx{led_pulse_kind = Kind, led_pulse_left = Ticks}.
+
+tick_led_pulse(CR = #cmd_rx{led_pulse_left = 0}) -> CR;
+tick_led_pulse(CR = #cmd_rx{led_pulse_left = 1}) ->
+    CR#cmd_rx{led_pulse_left = 0, led_pulse_kind = none};
+tick_led_pulse(CR = #cmd_rx{led_pulse_left = N}) ->
+    CR#cmd_rx{led_pulse_left = N - 1}.
+
+in_offset_range(V) ->
+    V >= -?CMD_MAX_OFFSET andalso V =< ?CMD_MAX_OFFSET.
 
 %%% ═══════════════════════════════════════════════════════════════════════════
 %%% Internal helpers
