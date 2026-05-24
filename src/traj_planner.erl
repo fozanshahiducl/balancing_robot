@@ -4,23 +4,29 @@
 %%% Trajectory path-following controller — no lifecycle state.
 %%%
 %%% This module handles the math of following a Catmull-Rom spline through
-%%% the WAYPOINTS list: pure-pursuit steering, speed scaling on curvature,
-%%% asymmetric acceleration/braking ramps, waypoint dwell, and final heading
-%%% alignment. It knows nothing about idle/paused/finished — those states
-%%% live in main_loop, which calls step/3 only when lifecycle == running.
+%%% the operator-injected waypoint list: pure-pursuit steering, speed scaling
+%%% on curvature, asymmetric acceleration/braking ramps, and waypoint dwell.
+%%% It knows nothing about idle/paused/finished — those states live in
+%%% main_loop, which calls step/3 only when lifecycle == running.
 %%%
 %%% Sub-state machine (only active during running lifecycle):
 %%%
-%%%   cruise      ──(dist < BRAKE_DIST)──▶ braking
-%%%   braking     ──(near WP & stopped)──▶ dwelling
-%%%   dwelling    ──(counter = 0, more WPs)──▶ cruise
-%%%   dwelling    ──(counter = 0, last WP)──▶ final_align
-%%%   final_align ──(heading within tol)──▶  [finished = true returned]
+%%%   cruise   ──(dist < BRAKE_DIST)──▶ braking
+%%%   braking  ──(near WP & stopped)──▶ dwelling
+%%%   dwelling ──(counter = 0, more WPs)──▶ cruise
+%%%   dwelling ──(counter = 0, last WP)──▶  [finished = true returned]
 %%%
 %%% When finished/1 returns true, main_loop transitions lifecycle to finished.
+%%% No return-to-origin and no final-heading alignment: when the last waypoint
+%%% has been dwelled the controller simply declares done.
 %%% ═══════════════════════════════════════════════════════════════════════════
 
--export([init/0, step/3, finished/1, config_string/0]).
+-export([init/0, step/3, finished/1, config_string/0,
+         append_waypoint/3, cancel_last/1, cancel_last_n/2,
+         clear_remaining/1, last_waypoint_abs/1, waypoint_count/1,
+         print_waypoints/1]).
+-export_type([traj_state/0]).
+
 -include("robot_types.hrl").
 
 %% ─── Physical ────────────────────────────────────────────────────────────────
@@ -46,46 +52,44 @@
 -define(SETTLE_VEL,        1.0).   %% cm/s — speed below this = considered stopped
 -define(DWELL_TICKS,     600).     %% ~2 s at 300 Hz
 
-%% ─── Final alignment ─────────────────────────────────────────────────────────
--define(FINAL_HEADING_TARGET,  0.0).   %% deg
--define(FINAL_HEADING_TOL,     5.0).   %% deg
-
 %% ─── Waypoints ───────────────────────────────────────────────────────────────
-%% First point must equal the robot's zeroed launch pose (0,0).
--define(WAYPOINTS, [
-    {  0.0,   0.0},
-    {  35.0,  0.0},
-    {  5.0,   0.0},
-    {  100.0,  -25.0},
-    {  150.0,  25.0},
-    {  200.0,  -25.0},
-    {  250.0,   25.0},
-    {  300.0,  0.0}
-]).
+%% Default is empty: the operator injects waypoints over the wire protocol
+%% (PROTO frames decoded in main_loop). When this list is empty the controller
+%% starts in a benign "nothing to do" state — step/3 returns zero velocities
+%% and done=true so main_loop drops straight from running to finished.
+-define(WAYPOINTS, []).
 
 -record(traj_state, {
     path         = []      :: [{float(), float()}],
     wps_rem      = []      :: [{float(), float()}],
-    substate     = cruise  :: cruise | braking | dwelling | final_align,
+    wps_full     = []      :: [{float(), float()}],  %% lockstep with wps_rem
+    substate     = cruise  :: cruise | braking | dwelling,
     counter      = 0       :: non_neg_integer(),   %% dwell countdown
     prev_adv_v   = 0.0     :: float(),
     prev_turn_v  = 0.0     :: float(),
     done         = false   :: boolean()
 }).
 
+-type traj_state() :: #traj_state{}.
+
 %% Build the spline path and seed the waypoint list. Called by main_loop on
 %% idle→running. traj_planner starts clean — no memory of a previous run.
--spec init() -> #traj_state{}.
+%% Empty WAYPOINTS produces an empty state; step/3 will immediately report done.
+-spec init() -> traj_state().
 init() ->
-    Path = spline:build_path(?WAYPOINTS, 30),
-    [_Start | Rest_WPs] = ?WAYPOINTS,
-    #traj_state{path = Path, wps_rem = Rest_WPs}.
+    init_from(?WAYPOINTS).
+
+init_from([]) ->
+    #traj_state{};
+init_from([_Start | Rest_WPs] = All) ->
+    Path = spline:build_path(All, 30),
+    #traj_state{path = Path, wps_rem = Rest_WPs, wps_full = Rest_WPs}.
 
 %% Called by main_loop every tick while lifecycle == running.
 %% Sensors = #{speed => float(), dt => float()}
 %% Pose    = #pose{} (owned by main_loop / odometry)
 %% Returns {Output, NewState} where Output = #{adv_v, turn_v, finished, substate, debug}
--spec step(map(), #pose{}, #traj_state{}) -> {map(), #traj_state{}}.
+-spec step(map(), #pose{}, traj_state()) -> {map(), traj_state()}.
 step(Sensors, Pose, State) ->
     #{speed := Speed, dt := Dt} = Sensors,
     #pose{x = X, y = Y, theta = Theta_Deg} = Pose,
@@ -114,6 +118,7 @@ step(Sensors, Pose, State) ->
     NewState = State#traj_state{
         path        = Path2,
         wps_rem     = WPs2,
+        wps_full    = WPs2,   %% maintain lockstep invariant wps_full == wps_rem
         substate    = SS2,
         counter     = Cnt2,
         prev_adv_v  = Adv_Out,
@@ -130,8 +135,10 @@ step(Sensors, Pose, State) ->
                              counter => Cnt2}},
     {Output, NewState}.
 
-%% True after final_align completes. main_loop uses this to transition lifecycle.
--spec finished(#traj_state{}) -> boolean().
+%% True after the last waypoint completes. main_loop uses this to transition
+%% lifecycle to finished. There is no return-to-origin and no final-heading
+%% alignment — the trajectory just stops.
+-spec finished(traj_state()) -> boolean().
 finished(#traj_state{done = D}) -> D.
 
 -spec config_string() -> string().
@@ -143,22 +150,69 @@ config_string() ->
          ?LOOKAHEAD, ?BRAKE_DIST, ?DWELL_TICKS]).
 
 %%% ═══════════════════════════════════════════════════════════════════════════
+%%% Public waypoint-array API (Phase 4)
+%%%
+%%% Pure functions over #traj_state{}. main_loop calls these from the wire-
+%%% protocol decoder (Phase 5). All operations preserve the lockstep invariant
+%%% wps_full == wps_rem; the field split is kept for forward-compatibility.
+%%% ═══════════════════════════════════════════════════════════════════════════
+
+-spec append_waypoint(float(), float(), traj_state()) -> traj_state().
+append_waypoint(AbsX, AbsY, S = #traj_state{wps_full = WF, wps_rem = WR}) ->
+    NewWP = {AbsX, AbsY},
+    S#traj_state{
+        wps_full = WF ++ [NewWP],
+        wps_rem  = WR ++ [NewWP]
+    }.
+
+%% No-op on empty so a stray cancel signal with no trajectory loaded is benign.
+-spec cancel_last(traj_state()) -> traj_state().
+cancel_last(S = #traj_state{wps_full = []}) -> S;
+cancel_last(S = #traj_state{wps_full = WF, wps_rem = WR}) ->
+    S#traj_state{
+        wps_full = lists:droplast(WF),
+        wps_rem  = lists:droplast(WR)
+    }.
+
+-spec cancel_last_n(non_neg_integer(), traj_state()) -> traj_state().
+cancel_last_n(0, S) -> S;
+cancel_last_n(_, S = #traj_state{wps_full = []}) -> S;
+cancel_last_n(N, S = #traj_state{wps_full = WF, wps_rem = WR}) ->
+    Keep = max(0, length(WF) - N),
+    S#traj_state{
+        wps_full = lists:sublist(WF, Keep),
+        wps_rem  = lists:sublist(WR, Keep)
+    }.
+
+-spec clear_remaining(traj_state()) -> traj_state().
+clear_remaining(S) ->
+    S#traj_state{wps_full = [], wps_rem = []}.
+
+-spec last_waypoint_abs(traj_state()) -> {float(), float()} | empty.
+last_waypoint_abs(#traj_state{wps_full = []}) -> empty;
+last_waypoint_abs(#traj_state{wps_full = WF}) -> lists:last(WF).
+
+-spec waypoint_count(traj_state()) -> non_neg_integer().
+waypoint_count(#traj_state{wps_full = WF}) -> length(WF).
+
+-spec print_waypoints(traj_state()) -> ok.
+print_waypoints(#traj_state{wps_full = []}) ->
+    io:format("WPS: (empty)~n");
+print_waypoints(#traj_state{wps_full = WF}) ->
+    io:format("WPS: ~p waypoint(s)~n", [length(WF)]),
+    lists:foldl(
+        fun({X, Y}, I) ->
+            io:format("  #~2..0B  x=~7.2f  y=~7.2f~n", [I, X, Y]),
+            I + 1
+        end, 1, WF),
+    ok.
+
+%%% ═══════════════════════════════════════════════════════════════════════════
 %%% Sub-state controller
 %%% ═══════════════════════════════════════════════════════════════════════════
 
-%% Final alignment — pivot in place toward 0°; declare done when within tol.
-substep(_X, _Y, Theta_Rad, _Speed, Path, [], final_align, Counter) ->
-    Theta_Deg = Theta_Rad * 180.0 / math:pi(),
-    Err = norm_angle(?FINAL_HEADING_TARGET - Theta_Deg),
-    if abs(Err) =< ?FINAL_HEADING_TOL ->
-           {0.0, 0.0, Path, [], final_align, Counter, true};
-       Err > 0.0 ->
-           {0.0,  ?MAX_TURN_V, Path, [], final_align, Counter, false};
-       true ->
-           {0.0, -?MAX_TURN_V, Path, [], final_align, Counter, false}
-    end;
-
-%% Empty waypoint list (any other substate) — done.
+%% Empty waypoint list — declare done. Covers both "no trajectory loaded at
+%% start" and "operator cleared mid-run" cases.
 substep(_X, _Y, _Theta_Rad, _Speed, Path, [], SubState, Counter) ->
     {0.0, 0.0, Path, [], SubState, Counter, true};
 
@@ -192,7 +246,7 @@ substep(X, Y, Theta_Rad, Speed, Path, [{WPx, WPy} | Rest_WPs] = WPs_Rem, SubStat
         dwelling ->
             if Counter =< 0 ->
                    case Rest_WPs of
-                       [] -> {0.0, 0.0, Path, [], final_align, 0, false};
+                       [] -> {0.0, 0.0, Path, [], dwelling, 0, true};
                        _  -> {0.0, 0.0, Path, Rest_WPs, cruise, 0, false}
                    end;
                true ->
@@ -206,13 +260,6 @@ dist_to_head(_X, _Y, []) -> 0.0;
 dist_to_head(X, Y, [{Wx, Wy} | _]) ->
     Dx = Wx - X, Dy = Wy - Y,
     math:sqrt(Dx*Dx + Dy*Dy).
-
-norm_angle(A0) ->
-    A = math:fmod(A0, 360.0),
-    if A >  180.0 -> A - 360.0;
-       A < -180.0 -> A + 360.0;
-       true       -> A
-    end.
 
 clamp(V, Lo, Hi) ->
     if V < Lo -> Lo; V > Hi -> Hi; true -> V end.
