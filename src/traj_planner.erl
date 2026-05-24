@@ -160,33 +160,49 @@ config_string() ->
 -spec append_waypoint(float(), float(), traj_state()) -> traj_state().
 append_waypoint(AbsX, AbsY, S = #traj_state{wps_full = WF, wps_rem = WR}) ->
     NewWP = {AbsX, AbsY},
+    %% Coming out of an empty/finished state we also clear the done flag so the
+    %% controller is willing to accept a fresh run once a path is built.
     S#traj_state{
         wps_full = WF ++ [NewWP],
-        wps_rem  = WR ++ [NewWP]
+        wps_rem  = WR ++ [NewWP],
+        done     = false,
+        substate = cruise,
+        counter  = 0
     }.
 
 %% No-op on empty so a stray cancel signal with no trajectory loaded is benign.
 -spec cancel_last(traj_state()) -> traj_state().
 cancel_last(S = #traj_state{wps_full = []}) -> S;
 cancel_last(S = #traj_state{wps_full = WF, wps_rem = WR}) ->
-    S#traj_state{
+    reset_if_empty(S#traj_state{
         wps_full = lists:droplast(WF),
         wps_rem  = lists:droplast(WR)
-    }.
+    }).
 
 -spec cancel_last_n(non_neg_integer(), traj_state()) -> traj_state().
 cancel_last_n(0, S) -> S;
 cancel_last_n(_, S = #traj_state{wps_full = []}) -> S;
 cancel_last_n(N, S = #traj_state{wps_full = WF, wps_rem = WR}) ->
     Keep = max(0, length(WF) - N),
-    S#traj_state{
+    reset_if_empty(S#traj_state{
         wps_full = lists:sublist(WF, Keep),
         wps_rem  = lists:sublist(WR, Keep)
-    }.
+    }).
 
+%% Clear-all is a hard stop+reset: empties the list and rewinds the substate
+%% machine. step/3 will return done=true on the next tick (empty wps clause)
+%% which lets main_loop's lifecycle FSM transition running → finished naturally.
 -spec clear_remaining(traj_state()) -> traj_state().
 clear_remaining(S) ->
-    S#traj_state{wps_full = [], wps_rem = []}.
+    S#traj_state{wps_full = [], wps_rem = [], path = [],
+                 substate = cruise, counter = 0, done = false}.
+
+%% Stop-and-reset when a cancel drains the list. Same shape as clear_remaining
+%% minus the explicit path wipe (path is already orphaned wrt the new list and
+%% will be rebuilt in Phase 6).
+reset_if_empty(S = #traj_state{wps_full = []}) ->
+    S#traj_state{path = [], substate = cruise, counter = 0, done = false};
+reset_if_empty(S) -> S.
 
 -spec last_waypoint_abs(traj_state()) -> {float(), float()} | empty.
 last_waypoint_abs(#traj_state{wps_full = []}) -> empty;
@@ -225,6 +241,11 @@ substep(X, Y, Theta_Rad, Speed, Path, [{WPx, WPy} | Rest_WPs] = WPs_Rem, SubStat
         cruise ->
             if Dist_To_WP < ?BRAKE_DIST ->
                    {0.0, 0.0, Path, WPs_Rem, braking, 0, false};
+               Path =:= [] ->
+                   %% Phase 5: spline rebuild is deferred. Waypoints exist but
+                   %% no path has been computed for them yet — freeze in place
+                   %% instead of feeding an empty list to pure_pursuit.
+                   {0.0, 0.0, Path, WPs_Rem, cruise, 0, false};
                true ->
                    Path_New   = pure_pursuit:advance(Path, X, Y, Theta_Rad),
                    {Lx, Ly}   = pure_pursuit:find_lookahead(Path_New, X, Y, ?LOOKAHEAD),

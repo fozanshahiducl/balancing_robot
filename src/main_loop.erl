@@ -122,7 +122,11 @@ robot_init(Hera_pid) ->
     io:format("[Robot] Pid speed=~p  stability=~p~n", [Pid_Speed, Pid_Stability]),
     io:format("[Robot] Starting robot.~n"),
 
-    RS = #rstate{},
+    %% init traj at boot so the wire-protocol decoder always has a live
+    %% #traj_state{} to mutate, laptop can queue waypoints even while idle.
+    %% lifecycle_step no longer wipes this on transitions, only Clear_All over
+    %% the wire empties it (FB_Hold reset preserves the array now)
+    RS = #rstate{traj = traj_planner:init()},
 
     robot_main(T0, Hera_pid, {T0, X0, P0}, I2Cbus,
                {0, T0, []},
@@ -179,11 +183,15 @@ robot_main(Start_Time, Hera_pid,
                              true      -> CtrlByte
                           end,
 
-    %%─── 3b. wp inject fsm (phase 2: prints + leds only) ────────────────────
+    %%─── 3b. wp inject fsm + traj-array mutation (phases 2+5) ───────────────
     %% b6=1 -> protocol byt, else its just normal drive
     %% runs regardless of lifecycle so op can q waypoints anytime
-    %% drive lockout + traj wiring comes later (phases 4-5)
-    CmdRx1 = cmd_rx_step(CtrlByte, RS#rstate.cmd_rx),
+    %% phase 5, dispatch produces a CmdAction, we apply it to the live traj
+    %% below. phase 6 (deferred), spline rebuild on each mutation
+    {CmdAction, CmdRx1} = cmd_rx_step(CtrlByte, RS#rstate.cmd_rx),
+    {Traj0, Pose0, LC_Override} =
+        apply_cmd_action(CmdAction, RS#rstate.traj,
+                         RS#rstate.pose, RS#rstate.lifecycle),
 
     %%─── 4. Tilt — only the filter selected by ?USE_KALMAN runs ──────────────
     %% Selection is now a compile-time flag, not a remote-toggled bit. The
@@ -228,12 +236,14 @@ robot_main(Start_Time, Hera_pid,
     FB_Hold_500 = FB_Held >= ?TRAJ_HOLD_MS,
 
     %%─── 7. Odometry (running only) ──────────────────────────────────────────
-    %% Pose output is only consumed by traj_planner and csv_logger, both gated
+    %% pose output is only consumed by traj_planner and csv_logger, both gated
     %% on lifecycle=running. lifecycle_step resets pose to zero on idle→running,
     %% so skipping integration outside running is safe.
+    %% Pose0 came from apply_cmd_action, normally same as RS.pose but Clear_All
+    %% zeroes it (doesnt drive home, just clears the values)
     Pose1 = case RS#rstate.lifecycle of
-        running -> odometry:integrate({Speed_L, Speed_R}, Dt, RS#rstate.pose);
-        _       -> RS#rstate.pose
+        running -> odometry:integrate({Speed_L, Speed_R}, Dt, Pose0);
+        _       -> Pose0
     end,
 
     %%─── 8. Lifecycle state machine ──────────────────────────────────────────
@@ -244,7 +254,9 @@ robot_main(Start_Time, Hera_pid,
         lr_held_ms    = LR_Held,
         prev_fb_combo = FB_Combo,
         prev_lr_combo = LR_Combo,
-        cmd_rx        = CmdRx1
+        cmd_rx        = CmdRx1,
+        traj          = Traj0,
+        lifecycle     = LC_Override
     },
     {LC_New, TrajState1, Pose2, RS2} =
         lifecycle_step(RS1, FB_Edge, FB_Hold_500, Now),
@@ -385,26 +397,32 @@ lifecycle_step(RS, FB_Edge, FB_Hold_500, Now) ->
     case LC of
         idle ->
             if FB_Edge andalso Reset_OK ->
-                   TS2 = traj_planner:init(),
+                   %% phase 5, keep the queued waypoint array, only the pose
+                   %% and csv_logger baseline are reset. operator uses Clear_All
+                   %% on the wire to wipe waypoints
                    csv_logger:reset(),
                    RS2 = RS#rstate{lifecycle            = running,
                                    lifecycle_entered_ms = Now,
                                    last_traj_action_ms  = Now,
-                                   traj = TS2, pose = #pose{}},
-                   {running, TS2, RS2#rstate.pose, RS2};
+                                   pose = #pose{}},
+                   {running, TS, RS2#rstate.pose, RS2};
                true ->
                    {idle, TS, RS#rstate.pose, RS}
             end;
 
         running ->
             if not RobUp ->
-                   RS2 = RS#rstate{lifecycle = idle, traj = undefined,
+                   %% phase 5, keep traj across reset so queued waypoints
+                   %% persist, operator uses Clear_All over the wire to wipe
+                   RS2 = RS#rstate{lifecycle = idle,
                                    last_reset_ms = Now},
-                   {idle, undefined, RS2#rstate.pose, RS2};
+                   {idle, TS, RS2#rstate.pose, RS2};
                FB_Hold_500 ->
-                   RS2 = RS#rstate{lifecycle = idle, traj = undefined,
+                   %% phase 5, keep traj across reset so queued waypoints
+                   %% persist, operator uses Clear_All over the wire to wipe
+                   RS2 = RS#rstate{lifecycle = idle,
                                    last_reset_ms = Now},
-                   {idle, undefined, RS2#rstate.pose, RS2};
+                   {idle, TS, RS2#rstate.pose, RS2};
                FB_Edge andalso Traj_OK ->
                    RS2 = RS#rstate{lifecycle            = paused,
                                    lifecycle_entered_ms = Now,
@@ -416,13 +434,17 @@ lifecycle_step(RS, FB_Edge, FB_Hold_500, Now) ->
 
         paused ->
             if not RobUp ->
-                   RS2 = RS#rstate{lifecycle = idle, traj = undefined,
+                   %% phase 5, keep traj across reset so queued waypoints
+                   %% persist, operator uses Clear_All over the wire to wipe
+                   RS2 = RS#rstate{lifecycle = idle,
                                    last_reset_ms = Now},
-                   {idle, undefined, RS2#rstate.pose, RS2};
+                   {idle, TS, RS2#rstate.pose, RS2};
                FB_Hold_500 ->
-                   RS2 = RS#rstate{lifecycle = idle, traj = undefined,
+                   %% phase 5, keep traj across reset so queued waypoints
+                   %% persist, operator uses Clear_All over the wire to wipe
+                   RS2 = RS#rstate{lifecycle = idle,
                                    last_reset_ms = Now},
-                   {idle, undefined, RS2#rstate.pose, RS2};
+                   {idle, TS, RS2#rstate.pose, RS2};
                FB_Edge andalso Traj_OK ->
                    RS2 = RS#rstate{lifecycle            = running,
                                    lifecycle_entered_ms = Now,
@@ -434,17 +456,19 @@ lifecycle_step(RS, FB_Edge, FB_Hold_500, Now) ->
 
         finished ->
             if FB_Hold_500 ->
-                   RS2 = RS#rstate{lifecycle = idle, traj = undefined,
+                   %% phase 5, keep traj across reset so queued waypoints
+                   %% persist, operator uses Clear_All over the wire to wipe
+                   RS2 = RS#rstate{lifecycle = idle,
                                    last_reset_ms = Now},
-                   {idle, undefined, RS2#rstate.pose, RS2};
+                   {idle, TS, RS2#rstate.pose, RS2};
                FB_Edge ->
-                   TS2 = traj_planner:init(),
+                   %% phase 5, same policy as idle→running, keep waypoint array
                    csv_logger:reset(),
                    RS2 = RS#rstate{lifecycle            = running,
                                    lifecycle_entered_ms = Now,
                                    last_traj_action_ms  = Now,
-                                   traj = TS2, pose = #pose{}},
-                   {running, TS2, RS2#rstate.pose, RS2};
+                                   pose = #pose{}},
+                   {running, TS, RS2#rstate.pose, RS2};
                true ->
                    {finished, TS, RS#rstate.pose, RS}
             end
@@ -540,6 +564,12 @@ state_outputs(State) ->
 %% effects rn = io:format prints + led pulse state on #cmd_rx{}
 %% no traj mutation yet, comes phases 4-5
 
+%% Returns {Action, NewCR}. Action is consumed by apply_cmd_action/3 below.
+%%   Action ::= none
+%%            | {append, DX, DY}
+%%            | cancel_last
+%%            | {cancel_n, N}
+%%            | clear_all
 cmd_rx_step(CtrlByte, CR = #cmd_rx{}) ->
     CR1 = tick_led_pulse(CR),
     Stable_New =
@@ -558,71 +588,132 @@ cmd_rx_step(CtrlByte, CR = #cmd_rx{}) ->
             dispatch_frame(Kind, Payload, CR3);
         {false, true, _} ->
             %% stable drive byt - drop the gate so next proto byt counts fresh
-            CR2#cmd_rx{last_committed_byte = -1};
+            {none, CR2#cmd_rx{last_committed_byte = -1}};
         _ ->
-            CR2
+            {none, CR2}
     end.
 
 %% ABORT in idle = silent noop, else reset w/ err blink
 dispatch_frame(false, ?CMD_CTRL_ABORT, CR = #cmd_rx{state = idle}) ->
-    CR;
+    {none, CR};
 dispatch_frame(false, ?CMD_CTRL_ABORT, CR) ->
-    pulse(reset_cmd_rx(CR), cmd_error, ?CMD_LED_PULSE_ERROR);
+    {none, pulse(reset_cmd_rx(CR), cmd_error, ?CMD_LED_PULSE_ERROR)};
 
 %% from idle a ctrl frame kicks off a transaction
 dispatch_frame(false, ?CMD_CTRL_ADD_HEADER, CR = #cmd_rx{state = idle}) ->
-    pulse(CR#cmd_rx{state = want_x_hi}, cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
+    {none, pulse(CR#cmd_rx{state = want_x_hi}, cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK)};
 dispatch_frame(false, ?CMD_CTRL_CANCEL_LAST, CR = #cmd_rx{state = idle}) ->
     io:format("RX_CANCEL_LAST~n"),
-    pulse(reset_cmd_rx(CR), cmd_committed, ?CMD_LED_PULSE_COMMITTED);
+    {cancel_last,
+     pulse(reset_cmd_rx(CR), cmd_committed, ?CMD_LED_PULSE_COMMITTED)};
 dispatch_frame(false, ?CMD_CTRL_CLEAR_ALL, CR = #cmd_rx{state = idle}) ->
     io:format("RX_CLEAR_ALL~n"),
-    pulse(reset_cmd_rx(CR), cmd_committed, ?CMD_LED_PULSE_COMMITTED);
+    {clear_all,
+     pulse(reset_cmd_rx(CR), cmd_committed, ?CMD_LED_PULSE_COMMITTED)};
 dispatch_frame(false, ?CMD_CTRL_CANCEL_N_HDR, CR = #cmd_rx{state = idle}) ->
-    pulse(CR#cmd_rx{state = want_n}, cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
+    {none, pulse(CR#cmd_rx{state = want_n}, cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK)};
 
 %% ADD seq: data HI_TO_LO data X_TO_Y data HI_TO_LO data ADD_COMMIT
 dispatch_frame(true, Payload, CR = #cmd_rx{state = want_x_hi}) ->
-    pulse(CR#cmd_rx{state = want_x_hi_to_lo, x_acc = Payload bsl 5},
-          cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
+    {none, pulse(CR#cmd_rx{state = want_x_hi_to_lo, x_acc = Payload bsl 5},
+                 cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK)};
 dispatch_frame(false, ?CMD_CTRL_HI_TO_LO, CR = #cmd_rx{state = want_x_hi_to_lo}) ->
-    pulse(CR#cmd_rx{state = want_x_lo}, cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
+    {none, pulse(CR#cmd_rx{state = want_x_lo}, cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK)};
 dispatch_frame(true, Payload, CR = #cmd_rx{state = want_x_lo}) ->
-    pulse(CR#cmd_rx{state = want_x_to_y, x_acc = CR#cmd_rx.x_acc bor Payload},
-          cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
+    {none, pulse(CR#cmd_rx{state = want_x_to_y, x_acc = CR#cmd_rx.x_acc bor Payload},
+                 cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK)};
 dispatch_frame(false, ?CMD_CTRL_X_TO_Y, CR = #cmd_rx{state = want_x_to_y}) ->
-    pulse(CR#cmd_rx{state = want_y_hi}, cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
+    {none, pulse(CR#cmd_rx{state = want_y_hi}, cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK)};
 dispatch_frame(true, Payload, CR = #cmd_rx{state = want_y_hi}) ->
-    pulse(CR#cmd_rx{state = want_y_hi_to_lo, y_acc = Payload bsl 5},
-          cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
+    {none, pulse(CR#cmd_rx{state = want_y_hi_to_lo, y_acc = Payload bsl 5},
+                 cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK)};
 dispatch_frame(false, ?CMD_CTRL_HI_TO_LO, CR = #cmd_rx{state = want_y_hi_to_lo}) ->
-    pulse(CR#cmd_rx{state = want_y_lo}, cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
+    {none, pulse(CR#cmd_rx{state = want_y_lo}, cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK)};
 dispatch_frame(true, Payload, CR = #cmd_rx{state = want_y_lo}) ->
-    pulse(CR#cmd_rx{state = want_commit, y_acc = CR#cmd_rx.y_acc bor Payload},
-          cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
+    {none, pulse(CR#cmd_rx{state = want_commit, y_acc = CR#cmd_rx.y_acc bor Payload},
+                 cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK)};
 dispatch_frame(false, ?CMD_CTRL_ADD_COMMIT, CR = #cmd_rx{state = want_commit}) ->
     DX = CR#cmd_rx.x_acc - ?CMD_SIGN_OFFSET,
     DY = CR#cmd_rx.y_acc - ?CMD_SIGN_OFFSET,
     case in_offset_range(DX) andalso in_offset_range(DY) of
         true ->
             io:format("RX_WP: dx=~p dy=~p~n", [DX, DY]),
-            pulse(reset_cmd_rx(CR), cmd_committed, ?CMD_LED_PULSE_COMMITTED);
+            {{append, DX, DY},
+             pulse(reset_cmd_rx(CR), cmd_committed, ?CMD_LED_PULSE_COMMITTED)};
         false ->
             io:format("RX_WP_ERR: dx=~p dy=~p (out of range)~n", [DX, DY]),
-            pulse(reset_cmd_rx(CR), cmd_error, ?CMD_LED_PULSE_ERROR)
+            {none, pulse(reset_cmd_rx(CR), cmd_error, ?CMD_LED_PULSE_ERROR)}
     end;
 
 %% CANCEL_N seq: data, CANCEL_N_COMMIT
 dispatch_frame(true, Payload, CR = #cmd_rx{state = want_n}) ->
-    pulse(CR#cmd_rx{state = want_n_commit, n_acc = Payload},
-          cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
+    {none, pulse(CR#cmd_rx{state = want_n_commit, n_acc = Payload},
+                 cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK)};
 dispatch_frame(false, ?CMD_CTRL_CANCEL_N_COMMIT, CR = #cmd_rx{state = want_n_commit}) ->
-    io:format("RX_CANCEL_N: ~p~n", [CR#cmd_rx.n_acc]),
-    pulse(reset_cmd_rx(CR), cmd_committed, ?CMD_LED_PULSE_COMMITTED);
+    N = CR#cmd_rx.n_acc,
+    io:format("RX_CANCEL_N: ~p~n", [N]),
+    {{cancel_n, N},
+     pulse(reset_cmd_rx(CR), cmd_committed, ?CMD_LED_PULSE_COMMITTED)};
 
 %% anything else in any state = proto err, reset + err blink
 dispatch_frame(_Kind, _Payload, CR) ->
-    pulse(reset_cmd_rx(CR), cmd_error, ?CMD_LED_PULSE_ERROR).
+    {none, pulse(reset_cmd_rx(CR), cmd_error, ?CMD_LED_PULSE_ERROR)}.
+
+%% phase 5, apply a decoded action to the live #traj_state{} and print the
+%% resulting array. returns {NewTS, NewPose, NewLC} so the caller can also pick
+%% up a pose reset (Clear_All zeroes pose values) and a lifecycle hint
+%% (append-while-finished goes to paused, append while running with <2 waypoints
+%% remaining also pauses so phase 6 can rebuild the spline before resume).
+%%
+%% reference point for ADD is the last queued waypoint, or current pose if the
+%% array is empty
+apply_cmd_action(none, TS, Pose, LC) -> {TS, Pose, LC};
+
+apply_cmd_action({append, DX, DY}, TS, Pose, LC) ->
+    {LastX, LastY} =
+        case traj_planner:last_waypoint_abs(TS) of
+            empty    -> {Pose#pose.x, Pose#pose.y};
+            {LX, LY} -> {LX, LY}
+        end,
+    AbsX = LastX + float(DX),
+    AbsY = LastY + float(DY),
+    PreCount = traj_planner:waypoint_count(TS),
+    TS2 = traj_planner:append_waypoint(AbsX, AbsY, TS),
+    traj_planner:print_waypoints(TS2),
+
+    %% phase 6 placeholder, real spline call goes here, not wired yet
+    %% if PreCount >= 2, extend existing path from old-last to new point,
+    %%   e.g. spline:extend_path(Path, {LastX, LastY}, {AbsX, AbsY}, 30)
+    %% otherwise (PreCount =< 1), pause traj and rebuild from old-last to new,
+    %%   e.g. spline:build_path([{LastX, LastY}, {AbsX, AbsY}], 30)
+
+    %% lifecycle hint, finished+append goes to paused so operator presses F+B
+    %% to resume against the new array. running with <2 waypoints in flight
+    %% also pauses so the rebuild from old-last to new can happen cleanly.
+    %% other lifecycles unchanged.
+    LC_New = case LC of
+        finished                          -> paused;
+        running when PreCount =< 1        -> paused;
+        _                                 -> LC
+    end,
+    {TS2, Pose, LC_New};
+
+apply_cmd_action(cancel_last, TS, Pose, LC) ->
+    TS2 = traj_planner:cancel_last(TS),
+    traj_planner:print_waypoints(TS2),
+    {TS2, Pose, LC};
+
+apply_cmd_action({cancel_n, N}, TS, Pose, LC) ->
+    TS2 = traj_planner:cancel_last_n(N, TS),
+    traj_planner:print_waypoints(TS2),
+    {TS2, Pose, LC};
+
+apply_cmd_action(clear_all, TS, _Pose, LC) ->
+    TS2 = traj_planner:clear_remaining(TS),
+    traj_planner:print_waypoints(TS2),
+    %% Clear_All also zeroes the pose values (no driving back to 0,0,0,
+    %% just clears the numbers so future ADD references start fresh)
+    {TS2, #pose{}, LC}.
 
 reset_cmd_rx(CR) ->
     %% keep debounce fields, just wipe fsm state + accs
