@@ -67,11 +67,7 @@
     traj                = undefined :: term(),
 
     robot_state         = rest      :: atom(),
-    robot_up            = false     :: boolean(),
-
-    %% Gyro-integrated yaw (deg, normalized [-180,180]). Log-only.
-    %% Reset to 0.0 on idle→running and finished→running, alongside pose.
-    yaw_gyro            = 0.0       :: float()
+    robot_up            = false     :: boolean()
 }).
 
 %%% ═══════════════════════════════════════════════════════════════════════════
@@ -131,9 +127,8 @@ robot_main(Start_Time, Hera_pid,
     Now   = erlang:system_time(millisecond),
 
     %%─── 2. IMU ──────────────────────────────────────────────────────────────
-    %% Gx (out_x_g) is the yaw-rate axis (up = +X). Log-only via gyro_yaw.
-    [Gy, Gx, Ax, Az] = pmod_nav:read(acc,
-        [out_y_g, out_x_g, out_x_xl, out_z_xl], #{g_unit => dps}),
+    [Gy, Ax, Az] = pmod_nav:read(acc,
+        [out_y_g, out_x_xl, out_z_xl], #{g_unit => dps}),
 
     %%─── 3. ESP32 ────────────────────────────────────────────────────────────
     [<<SL1,SL2,SR1,SR2,CtrlByte>>] = grisp_i2c:transfer(I2Cbus, [{read, 16#40, 1, 5}]),
@@ -196,18 +191,9 @@ robot_main(Start_Time, Hera_pid,
         _       -> RS#rstate.pose
     end,
 
-    %%─── 7b. Gyro yaw (running only, log-only) ───────────────────────────────
-    %% Same gating as odometry; lifecycle_step resets yaw_gyro on entry to
-    %% running so it shares an origin with pose.theta for visual comparison.
-    {Yaw_Gyro_1, Gx_Corr} = case RS#rstate.lifecycle of
-        running -> gyro_yaw:step(RS#rstate.yaw_gyro, Gx, Gx0, Angle, Dt);
-        _       -> {RS#rstate.yaw_gyro, Gx - Gx0}
-    end,
-
     %%─── 8. Lifecycle state machine ──────────────────────────────────────────
     RS1 = RS#rstate{
         pose          = Pose1,
-        yaw_gyro      = Yaw_Gyro_1,
         robot_up      = Robot_Up_New,
         fb_held_ms    = FB_Held,
         lr_held_ms    = LR_Held,
@@ -291,9 +277,7 @@ robot_main(Start_Time, Hera_pid,
                                             turn_v     => Turn_V_Goal,
                                             dist_wp    => TrajDistWP,
                                             wps_left   => WpsLeft,
-                                            yaw_odo    => PT,
-                                            yaw_gyro   => RS2#rstate.yaw_gyro,
-                                            gx_dps     => Gx_Corr});
+                                            yaw_odo    => PT});
                skipped -> ok
            end;
        true -> ok
@@ -364,8 +348,7 @@ lifecycle_step(RS, FB_Edge, FB_Hold_500, Now) ->
                    RS2 = RS#rstate{lifecycle            = running,
                                    lifecycle_entered_ms = Now,
                                    last_traj_action_ms  = Now,
-                                   traj = TS2, pose = #pose{},
-                                   yaw_gyro = gyro_yaw:reset()},
+                                   traj = TS2, pose = #pose{}},
                    {running, TS2, RS2#rstate.pose, RS2};
                true ->
                    {idle, TS, RS#rstate.pose, RS}
@@ -418,8 +401,7 @@ lifecycle_step(RS, FB_Edge, FB_Hold_500, Now) ->
                    RS2 = RS#rstate{lifecycle            = running,
                                    lifecycle_entered_ms = Now,
                                    last_traj_action_ms  = Now,
-                                   traj = TS2, pose = #pose{},
-                                   yaw_gyro = gyro_yaw:reset()},
+                                   traj = TS2, pose = #pose{}},
                    {running, TS2, RS2#rstate.pose, RS2};
                true ->
                    {finished, TS, RS#rstate.pose, RS}

@@ -9,7 +9,7 @@
 %%%
 %%% CSV column order:
 %%%   T_ms, lifecycle, substate, x, y, speed,
-%%%   adv_v, turn_v, dist_wp, wps_left, yaw_odo, yaw_gyro, gx_dps
+%%%   adv_v, turn_v, dist_wp, wps_left, yaw_odo
 %%% ═══════════════════════════════════════════════════════════════════════════
 
 -export([reset/0, append/0, emit_serial/1]).
@@ -18,7 +18,7 @@
 
 -define(CSV_HEADER,
     "T_ms,lifecycle,substate,x,y,speed,"
-    "adv_v,turn_v,dist_wp,wps_left,yaw_odo,yaw_gyro,gx_dps\n").
+    "adv_v,turn_v,dist_wp,wps_left,yaw_odo\n").
 
 %%% ─── Public API ─────────────────────────────────────────────────────────────
 
@@ -55,8 +55,6 @@ emit_serial(Row) ->
       turn_v     := Turn,
       dist_wp    := Dist,
       wps_left   := WpsL,
-      yaw_odo    := YO,
-      yaw_gyro   := YG,
-      gx_dps     := GxC} = Row,
-    io:format("TLOG,~p,~p,~p,~.2f,~.2f,~.2f,~.2f,~.2f,~.2f,~p,~.2f,~.2f,~.2f~n",
-              [T_ms, LC, SS, X, Y, Speed, Adv, Turn, Dist, WpsL, YO, YG, GxC]).
+      yaw_odo    := YO} = Row,
+    io:format("TLOG,~p,~p,~p,~.2f,~.2f,~.2f,~.2f,~.2f,~.2f,~p,~.2f~n",
+              [T_ms, LC, SS, X, Y, Speed, Adv, Turn, Dist, WpsL, YO]).
