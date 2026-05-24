@@ -29,6 +29,7 @@
 
 %% ─── Feature flags ───────────────────────────────────────────────────────────
 -define(ENABLE_TRAJECTORY, true).    %% trajectory layer
+-define(USE_KALMAN,        true).    %% true=Kalman tilt filter, false=complementary
 
 %% ─── Angles & velocity limits ────────────────────────────────────────────────
 -define(RAD_TO_DEG, 180.0/math:pi()).
@@ -48,8 +49,10 @@
 %% wp injection fsm - phase 2 just prints + leds, no traj stuff yet
 -record(cmd_rx, {
     state               = idle :: idle
-                                | want_x_hi  | want_x_lo  | want_x_to_y
-                                | want_y_hi  | want_y_lo  | want_commit
+                                | want_x_hi  | want_x_hi_to_lo
+                                | want_x_lo  | want_x_to_y
+                                | want_y_hi  | want_y_hi_to_lo
+                                | want_y_lo  | want_commit
                                 | want_n     | want_n_commit,
     x_acc               = 0    :: 0..1023,
     y_acc               = 0    :: 0..1023,
@@ -84,6 +87,10 @@
 
     robot_state         = rest      :: atom(),
     robot_up            = false     :: boolean(),
+
+    %% Latched on every PROTO=0 (drive) byte, replayed during PROTO=1 bursts so
+    %% protocol payloads cannot ghost-press Get_Up / F / B / L / R.
+    last_drive_byte     = 0         :: 0..255,
 
     cmd_rx              = #cmd_rx{} :: #cmd_rx{}
 }).
@@ -152,8 +159,25 @@ robot_main(Start_Time, Hera_pid,
     [<<SL1,SL2,SR1,SR2,CtrlByte>>] = grisp_i2c:transfer(I2Cbus, [{read, 16#40, 1, 5}]),
     [Speed_L, Speed_R] = hera_com:decode_half_float([<<SL1, SL2>>, <<SR1, SR2>>]),
     Speed = (Speed_L + Speed_R) / 2.0,
-    [Arm_Ready, Switch, Test, Get_Up, Forward, Backward, Left, Right] =
-        hera_com:get_bits(CtrlByte),
+
+    %% Drive-bit gating during proto bursts:
+    %%   bit 7 (Arm_Ready)        - always live (ESP owns it)
+    %%   bit 4 (Get_Up)           - latched from last drive byte (preserve stand)
+    %%   bits 3..0 (F/B/L/R)      - forced zero (Python suppresses these on tx)
+    %%   bits 6,5 (Switch/Test)   - decoded but ignored (filter is ?USE_KALMAN,
+    %%                              Hera log trigger removed)
+    Proto_Bit = (CtrlByte band ?CMD_PROTO_MASK) =/= 0,
+    Drive_Byte = if Proto_Bit ->
+                        (CtrlByte band 16#80)                          %% live Arm_Ready
+                        bor (RS#rstate.last_drive_byte band 16#10);    %% latched Get_Up
+                    true ->
+                        CtrlByte
+                 end,
+    [Arm_Ready, _Switch_unused, _Test_unused, Get_Up, Forward, Backward, Left, Right] =
+        hera_com:get_bits(Drive_Byte),
+    Last_Drive_Byte_New = if Proto_Bit -> RS#rstate.last_drive_byte;
+                             true      -> CtrlByte
+                          end,
 
     %%─── 3b. wp inject fsm (phase 2: prints + leds only) ────────────────────
     %% b6=1 -> protocol byt, else its just normal drive
@@ -161,16 +185,13 @@ robot_main(Start_Time, Hera_pid,
     %% drive lockout + traj wiring comes later (phases 4-5)
     CmdRx1 = cmd_rx_step(CtrlByte, RS#rstate.cmd_rx),
 
-    %%─── 4. Tilt — only the filter selected by Switch runs ───────────────────
-    %% Original code ran both Kalman and complementary every tick and discarded
-    %% one via select_angle. Each Kalman pass allocates ~7 mat:matrix structs
-    %% for the EKF; skipping the unused branch removes that GC pressure.
-    %% Behavior preserved: select_angle(Switch, ...) used Angle_Kalman (just
-    %% computed) when Switch=true, and Angle_Complem (previous tick, 1-tick lag)
-    %% when Switch=false. We replicate exactly that.
+    %%─── 4. Tilt — only the filter selected by ?USE_KALMAN runs ──────────────
+    %% Selection is now a compile-time flag, not a remote-toggled bit. The
+    %% original `Switch` wire-bit doubled as PROTO and made the filter flip
+    %% mid-waypoint upload; that's gone.
     Angle_Acc_Val = math:atan(Az /(-Ax)) * ?RAD_TO_DEG,
     {X1, P1, Angle_Kalman, Angle_Complem_New, Angle_Rate_New, Angle} =
-        case Switch of
+        case ?USE_KALMAN of
             true ->
                 {Xk, Pk} = kalman_angle(Dt, Ax, Az, Gy, Gy0, X0, P0),
                 [Th_K, _W] = mat:to_array(Xk),
@@ -308,22 +329,17 @@ robot_main(Start_Time, Hera_pid,
        true -> ok
     end,
 
-    %%─── 17. Frequency + legacy hera logging ─────────────────────────────────
+    %%─── 17. Frequency + shell-query plumbing ────────────────────────────────
+    %% The legacy Hera log path (Test bit -> 15s buffered log) is removed.
+    %% csv_logger covers run logging. The Log_* triple is kept as a no-op so
+    %% the recursive signature is unchanged.
     {N_New, Freq_New, Mean_Freq_New} = frequency_computation(Dt, N, Freq, Mean_Freq),
-    Log_End_New =
-        if Test -> erlang:system_time() / 1.0e6 + ?LOG_DURATION; true -> Log_End end,
-    Logging_New = erlang:system_time() / 1.0e6 < Log_End_New,
-    handle_hera_logging(Hera_pid, Logging, Logging_New),
-    Log_List_New =
-        if Logging_New ->
-               [[T1 - Start_Time, 1/Dt, Gy, Acc, CtrlByte,
-                 -Angle_Acc_Val, -Angle_Kalman, -Angle_Complem,
-                 Adv_V_Ref, Switch, Adv_V_Ref_New, Turn_V_Ref_New, Speed] | Log_List];
-           true -> Log_List
-        end,
+    Log_End_New  = Log_End,
+    Logging_New  = Logging,
+    Log_List_New = Log_List,
     handle_messages(T1, Start_Time, Dt, Gy, Acc, CtrlByte,
                     Angle_Acc_Val, Angle_Kalman, Angle_Complem,
-                    Adv_V_Ref, Switch, Adv_V_Ref_New, Turn_V_Ref_New, Speed,
+                    Adv_V_Ref, Adv_V_Ref_New, Turn_V_Ref_New, Speed,
                     Log_List),
 
     %%─── 18. Rate limiter ────────────────────────────────────────────────────
@@ -335,14 +351,15 @@ robot_main(Start_Time, Hera_pid,
 
     %%─── 19. Recurse ─────────────────────────────────────────────────────────
     RS_Next = RS2#rstate{
-        pose         = Pose2,
-        lifecycle    = LC_Final,
-        traj         = TrajState2,
-        robot_state  = Next_Robot_State,
-        robot_up     = Robot_Up_New,
-        traj_wps_left = WpsLeft,
-        traj_substate = TrajSS,
-        traj_counter  = TrajCnt
+        pose            = Pose2,
+        lifecycle       = LC_Final,
+        traj            = TrajState2,
+        robot_state     = Next_Robot_State,
+        robot_up        = Robot_Up_New,
+        traj_wps_left   = WpsLeft,
+        traj_substate   = TrajSS,
+        traj_counter    = TrajCnt,
+        last_drive_byte = Last_Drive_Byte_New
     },
     robot_main(Start_Time, Hera_pid,
                {T1, X1, P1}, I2Cbus,
@@ -564,18 +581,22 @@ dispatch_frame(false, ?CMD_CTRL_CLEAR_ALL, CR = #cmd_rx{state = idle}) ->
 dispatch_frame(false, ?CMD_CTRL_CANCEL_N_HDR, CR = #cmd_rx{state = idle}) ->
     pulse(CR#cmd_rx{state = want_n}, cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
 
-%% ADD seq: data data X_TO_Y data data ADD_COMMIT
+%% ADD seq: data HI_TO_LO data X_TO_Y data HI_TO_LO data ADD_COMMIT
 dispatch_frame(true, Payload, CR = #cmd_rx{state = want_x_hi}) ->
-    pulse(CR#cmd_rx{state = want_x_lo, x_acc = Payload bsl 5},
+    pulse(CR#cmd_rx{state = want_x_hi_to_lo, x_acc = Payload bsl 5},
           cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
+dispatch_frame(false, ?CMD_CTRL_HI_TO_LO, CR = #cmd_rx{state = want_x_hi_to_lo}) ->
+    pulse(CR#cmd_rx{state = want_x_lo}, cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
 dispatch_frame(true, Payload, CR = #cmd_rx{state = want_x_lo}) ->
     pulse(CR#cmd_rx{state = want_x_to_y, x_acc = CR#cmd_rx.x_acc bor Payload},
           cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
 dispatch_frame(false, ?CMD_CTRL_X_TO_Y, CR = #cmd_rx{state = want_x_to_y}) ->
     pulse(CR#cmd_rx{state = want_y_hi}, cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
 dispatch_frame(true, Payload, CR = #cmd_rx{state = want_y_hi}) ->
-    pulse(CR#cmd_rx{state = want_y_lo, y_acc = Payload bsl 5},
+    pulse(CR#cmd_rx{state = want_y_hi_to_lo, y_acc = Payload bsl 5},
           cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
+dispatch_frame(false, ?CMD_CTRL_HI_TO_LO, CR = #cmd_rx{state = want_y_hi_to_lo}) ->
+    pulse(CR#cmd_rx{state = want_y_lo}, cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
 dispatch_frame(true, Payload, CR = #cmd_rx{state = want_y_lo}) ->
     pulse(CR#cmd_rx{state = want_commit, y_acc = CR#cmd_rx.y_acc bor Payload},
           cmd_frame_ok, ?CMD_LED_PULSE_FRAME_OK);
@@ -665,18 +686,9 @@ frequency_computation(Dt, N, Freq, Mean_Freq) ->
        true      -> {N+1, ((Freq*N) + (1/Dt)) / (N+1), Mean_Freq}
     end.
 
-handle_hera_logging(Hera_pid, Logging, Logging_New) ->
-    if not Logging andalso Logging_New ->
-           Hera_pid ! {self(), start_log};
-       Logging andalso not Logging_New ->
-           led_control:idle(),
-           Hera_pid ! {self(), stop_log};
-       true -> ok
-    end.
-
 handle_messages(T1, Start_Time, Dt, Gy, Acc, CtrlByte,
                 Angle_Acc, Angle_Kalman, Angle_Complem,
-                Adv_V_Ref, Switch, Adv_V_Ref_New, Turn_V_Ref_New, Speed,
+                Adv_V_Ref, Adv_V_Ref_New, Turn_V_Ref_New, Speed,
                 Log_List) ->
     receive
         {From, log_values}  -> From ! {self(), log, Log_List};
@@ -684,7 +696,7 @@ handle_messages(T1, Start_Time, Dt, Gy, Acc, CtrlByte,
             From1 ! {self(), data,
                      [T1-Start_Time, 1/Dt, Gy, Acc, CtrlByte,
                       -Angle_Acc, -Angle_Kalman, -Angle_Complem,
-                      Adv_V_Ref, Switch, Adv_V_Ref_New, Turn_V_Ref_New, Speed]};
+                      Adv_V_Ref, Adv_V_Ref_New, Turn_V_Ref_New, Speed]};
         {From1, freq} -> From1 ! {self(), 1/Dt};
         {From2, acc}  -> From2 ! {self(), Acc};
         {_, Msg}      -> io:format("[Robot] Unknown msg: ~p~n", [Msg])

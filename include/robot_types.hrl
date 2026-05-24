@@ -24,6 +24,7 @@
 -define(CMD_CTRL_CANCEL_N_HDR,    2#10010).
 -define(CMD_CTRL_CANCEL_N_COMMIT, 2#10011).
 -define(CMD_CTRL_ADD_HEADER,      2#11000).
+-define(CMD_CTRL_HI_TO_LO,        2#11010).
 -define(CMD_CTRL_X_TO_Y,          2#11100).
 -define(CMD_CTRL_ADD_COMMIT,      2#11110).
 
@@ -32,8 +33,12 @@
 -define(CMD_KIND_MASK,    2#00100000).
 -define(CMD_PAYLOAD_MASK, 2#00011111).
 
-%% ADD seq (ui sends in order, ~60ms per frame):
-%%   ADD_HEADER, data X_hi, data X_lo, X_TO_Y, data Y_hi, data Y_lo, ADD_COMMIT
+%% ADD seq (ui sends in order, ~30ms per frame):
+%%   ADD_HEADER, data X_hi, HI_TO_LO, data X_lo, X_TO_Y,
+%%   data Y_hi, HI_TO_LO, data Y_lo, ADD_COMMIT
+%% HI_TO_LO is a ctrl separator between hi/lo data bytes so the receiver's
+%% commit gate never sees two byte-identical proto bytes back-to-back
+%% (would happen when 5-bit payloads collide, eg dx=16 -> x_hi=x_lo=2).
 %% signed encoding per axis - 10bits across two 5bit halves
 %%   ui:    enc = val + CMD_SIGN_OFFSET
 %%   bot:   val = ((hi bsl 5) bor lo) - CMD_SIGN_OFFSET
