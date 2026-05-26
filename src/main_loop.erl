@@ -5,23 +5,39 @@
 %%%
 %%% Owns:
 %%%   • Pose (#pose{}) — updated every tick via odometry:integrate/3.
-%%%   • Trajectory lifecycle state machine (idle/running/paused/finished).
+%%%   • Trajectory lifecycle state machine (idle/running/paused).
 %%%   • Button edge/hold detection and cooldown timers.
 %%%   • LED display.
 %%%   • Velocity mux (trajectory vs manual).
 %%%
 %%% Lifecycle state machine (owns here):
 %%%
-%%%   idle      ──(FB_Edge, reset_cooldown_ok)──▶ running
-%%%   running   ──(FB_Edge, 500 ms cooldown)──▶ paused
-%%%   running   ──(FB_Hold ≥ 500 ms)──▶ idle  (1 s reset cooldown starts)
-%%%   running   ──(Robot_Up false)──▶ idle    (fall reset)
-%%%   running   ──(traj_planner finished)──▶ finished
-%%%   paused    ──(FB_Edge, 500 ms cooldown)──▶ running
-%%%   paused    ──(FB_Hold ≥ 500 ms)──▶ idle  (1 s reset cooldown)
-%%%   paused    ──(Robot_Up false)──▶ idle    (fall reset)
-%%%   finished  ──(FB_Edge)──▶ running        (re-init traj_planner)
-%%%   finished  ──(FB_Hold ≥ 500 ms)──▶ idle
+%%% FB_Tap = F+B released after a *short* press (held < 500 ms).
+%%% FB_Hold ≥ 500 ms always wins on the same gesture — the tap is suppressed
+%%% when the press crosses the hold threshold, so a single long press cannot
+%%% chain reset → tap action.
+%%%
+%%% Every → idle transition (hold, fall, traj-done, cancel-drains, CLEAR_ALL)
+%%% wipes pose to {0,0,0}, clears wps_remaining AND wps_traversed, and stamps
+%%% the 1 s reset cooldown. Idle is the single terminal state — there is no
+%%% sticky "finished" state. Pre-flight queueing (ADD while idle) is allowed
+%%% and survives a fall in idle.
+%%%
+%%%   idle      ──(FB_Tap, reset_cooldown_ok)──▶ running
+%%%   idle      ──(FB_Hold ≥ 500 ms)──▶ idle (safety wipe + cooldown)
+%%%   running   ──(FB_Tap, 500 ms cooldown)──▶ paused
+%%%   running   ──(FB_Hold ≥ 500 ms)──▶ idle  (wipe + cooldown)
+%%%   running   ──(Robot_Up false)──▶ idle    (wipe + cooldown, fall reset)
+%%%   running   ──(traj_planner done)──▶ idle (wipe + cooldown)
+%%%   running   ──(cancel drains wps_remaining)──▶ idle (wipe + cooldown)
+%%%   paused    ──(FB_Tap, 500 ms cooldown)──▶ running
+%%%   paused    ──(FB_Hold ≥ 500 ms)──▶ idle  (wipe + cooldown)
+%%%   paused    ──(Robot_Up false)──▶ idle    (wipe + cooldown, fall reset)
+%%%   paused    ──(cancel drains wps_remaining)──▶ idle (wipe + cooldown)
+%%%   *         ──(CLEAR_ALL)──▶ idle         (wipe + cooldown)
+%%%
+%%% Non-draining cancel (wps_remaining still non-empty after cancel_last /
+%%% cancel_n) does NOT transition — rebuild_path/1 runs, robot keeps cruising.
 %%% ═══════════════════════════════════════════════════════════════════════════
 
 -export([robot_init/1, modify_frequency/1]).
@@ -67,7 +83,7 @@
 %% ─── Main state record ────────────────────────────────────────────────────────
 -record(rstate, {
     pose                = #pose{}   :: #pose{},
-    lifecycle           = idle      :: idle | running | paused | finished,
+    lifecycle           = idle      :: idle | running | paused,
     lifecycle_entered_ms = 0        :: non_neg_integer(),
 
     fb_held_ms          = 0         :: non_neg_integer(),
@@ -188,10 +204,36 @@ robot_main(Start_Time, Hera_pid,
     %% runs regardless of lifecycle so op can q waypoints anytime
     %% phase 5, dispatch produces a CmdAction, we apply it to the live traj
     %% below. phase 6 (deferred), spline rebuild on each mutation
+    HadRemainingBefore = traj_planner:has_remaining(RS#rstate.traj),
     {CmdAction, CmdRx1} = cmd_rx_step(CtrlByte, RS#rstate.cmd_rx),
-    {Traj0, Pose0, LC_Override} =
+    {Traj_Raw, Pose_Raw, LC_FromCmd} =
         apply_cmd_action(CmdAction, RS#rstate.traj,
                          RS#rstate.pose, RS#rstate.lifecycle),
+    HasRemainingAfter = traj_planner:has_remaining(Traj_Raw),
+
+    %% Wire-driven lifecycle overrides — every reset destination is idle now:
+    %%   CLEAR_ALL (any state)                  → idle, full wipe + cooldown
+    %%   running/paused + cancel drained list   → idle, full wipe + cooldown
+    %% Anything else passes through untouched. Non-draining cancel and ADD
+    %% rebuild the spline inside apply_cmd_action but don't transition.
+    {LC_Override, Traj0, Pose0, ResetStamp} =
+        case CmdAction of
+            clear_all ->
+                traj_planner:print_transition(RS#rstate.lifecycle, idle, Traj_Raw),
+                {idle, Traj_Raw, #pose{}, Now};
+            _ when HadRemainingBefore, not HasRemainingAfter,
+                   (LC_FromCmd =:= running orelse LC_FromCmd =:= paused) ->
+                Traj_Wiped = traj_planner:clear_remaining(Traj_Raw),
+                traj_planner:print_transition(LC_FromCmd, idle, Traj_Wiped),
+                {idle, Traj_Wiped, #pose{}, Now};
+            _ ->
+                {LC_FromCmd, Traj_Raw, Pose_Raw, keep}
+        end,
+    Last_Reset_Override =
+        case ResetStamp of
+            keep -> RS#rstate.last_reset_ms;
+            T    -> T
+        end,
 
     %%─── 4. Tilt — only the filter selected by ?USE_KALMAN runs ──────────────
     %% Selection is now a compile-time flag, not a remote-toggled bit. The
@@ -226,7 +268,7 @@ robot_main(Start_Time, Hera_pid,
     Prev_FB  = RS#rstate.prev_fb_combo,
     Prev_LR  = RS#rstate.prev_lr_combo,
 
-    FB_Edge  = input_combo:rising_edge(FB_Combo, Prev_FB),
+    FB_Falling = input_combo:falling_edge(FB_Combo, Prev_FB),
 
     FB_Base  = input_combo:hold_check(FB_Combo, Prev_FB, RS#rstate.fb_held_ms),
     FB_Held  = if FB_Combo -> FB_Base + Dt_ms; true -> 0 end,
@@ -234,6 +276,12 @@ robot_main(Start_Time, Hera_pid,
     LR_Held  = if LR_Combo -> LR_Base + Dt_ms; true -> 0 end,
 
     FB_Hold_500 = FB_Held >= ?TRAJ_HOLD_MS,
+    %% Tap = release within the hold threshold. fb_held_ms holds the duration
+    %% RIGHT BEFORE the falling-edge tick (hold_check returns 0 on release, so
+    %% FB_Held is already 0 here — we need the stored value). A release after
+    %% FB_Hold_500 has fired will have fb_held_ms >= ?TRAJ_HOLD_MS and is
+    %% suppressed, so the long-hold reset cannot chain into a tap.
+    FB_Tap = FB_Falling andalso (RS#rstate.fb_held_ms < ?TRAJ_HOLD_MS),
 
     %%─── 7. Odometry (running only) ──────────────────────────────────────────
     %% pose output is only consumed by traj_planner and csv_logger, both gated
@@ -256,10 +304,11 @@ robot_main(Start_Time, Hera_pid,
         prev_lr_combo = LR_Combo,
         cmd_rx        = CmdRx1,
         traj          = Traj0,
-        lifecycle     = LC_Override
+        lifecycle     = LC_Override,
+        last_reset_ms = Last_Reset_Override
     },
     {LC_New, TrajState1, Pose2, RS2} =
-        lifecycle_step(RS1, FB_Edge, FB_Hold_500, Now),
+        lifecycle_step(RS1, FB_Tap, FB_Hold_500, Now),
 
     %%─── 10. Trajectory controller (only when running) ───────────────────────
     {Adv_V_Traj, Turn_V_Traj, TrajFinished, WpsLeft, TrajSS, TrajCnt, TrajDistWP, TrajState2} =
@@ -278,13 +327,16 @@ robot_main(Start_Time, Hera_pid,
                 {0.0, 0.0, false, 0, idle, 0, 0.0, TrajState1}
         end,
 
-    %% Transition to finished if traj_planner signals completion.
-    LC_Final =
+    %% Traj completion lands directly in idle (no sticky finished state).
+    %% Full wipe + cooldown keeps idle's invariant: pose=0, traj cleared.
+    {LC_Final, RS2_Final, TrajState_Final} =
         if TrajFinished andalso LC_New =:= running ->
                io:format("===LOG_END_TRAJ===~n"),
-               finished;
+               traj_planner:print_transition(running, idle, TrajState2),
+               RS_Idle = go_idle(RS2, TrajState2, Now),
+               {idle, RS_Idle, RS_Idle#rstate.traj};
            true ->
-               LC_New
+               {LC_New, RS2, TrajState2}
         end,
 
     %%─── 11. Velocity mux ────────────────────────────────────────────────────
@@ -293,8 +345,7 @@ robot_main(Start_Time, Hera_pid,
     {Adv_V_Goal, Turn_V_Goal} =
         case LC_Final of
             running -> {Adv_V_Traj + Man_Adv, Turn_V_Traj + Man_Turn};
-            paused  -> {Man_Adv,               Man_Turn};
-            _       -> {Man_Adv,               Man_Turn}
+            _       -> {Man_Adv, Man_Turn}
         end,
 
     %%─── 12. Stability controller ────────────────────────────────────────────
@@ -307,7 +358,7 @@ robot_main(Start_Time, Hera_pid,
 
     %%─── 13. Robot_State machine ─────────────────────────────────────────────
     Next_Robot_State =
-        next_robot_state(RS2#rstate.robot_state, Robot_Up_New, Get_Up,
+        next_robot_state(RS2_Final#rstate.robot_state, Robot_Up_New, Get_Up,
                          Angle, Arm_Ready),
     {Power, Freeze, Extend, Robot_Up_Bit} = state_outputs(Next_Robot_State),
 
@@ -318,7 +369,7 @@ robot_main(Start_Time, Hera_pid,
     grisp_i2c:transfer(I2Cbus, [{write, 16#40, 1, [HF1, HF2, <<Output_Byte>>]}]),
 
     %%─── 15. LED ─────────────────────────────────────────────────────────────
-    update_leds(LC_Final, RS2#rstate.last_reset_ms, Now, RS2#rstate.cmd_rx),
+    update_leds(LC_Final, RS2_Final#rstate.last_reset_ms, Now, RS2_Final#rstate.cmd_rx),
 
     %%─── 16. CSV logging ─────────────────────────────────────────────────────
     if LC_Final =:= running ->
@@ -362,10 +413,11 @@ robot_main(Start_Time, Hera_pid,
     T_End_New = erlang:system_time() / 1.0e6,
 
     %%─── 19. Recurse ─────────────────────────────────────────────────────────
-    RS_Next = RS2#rstate{
-        pose            = Pose2,
+    %% RS2_Final carries the go_idle wipe (pose=0, traj cleared, cooldown
+    %% stamped) when traj-done fired this tick, otherwise it equals RS2.
+    RS_Next = RS2_Final#rstate{
         lifecycle       = LC_Final,
-        traj            = TrajState2,
+        traj            = TrajState_Final,
         robot_state     = Next_Robot_State,
         robot_up        = Robot_Up_New,
         traj_wps_left   = WpsLeft,
@@ -386,7 +438,7 @@ robot_main(Start_Time, Hera_pid,
 %%% Lifecycle state machine
 %%% ═══════════════════════════════════════════════════════════════════════════
 
-lifecycle_step(RS, FB_Edge, FB_Hold_500, Now) ->
+lifecycle_step(RS, FB_Tap, FB_Hold_500, Now) ->
     LC    = RS#rstate.lifecycle,
     RobUp = RS#rstate.robot_up,
     TS    = RS#rstate.traj,
@@ -395,35 +447,40 @@ lifecycle_step(RS, FB_Edge, FB_Hold_500, Now) ->
     Reset_OK  = (Now - RS#rstate.last_reset_ms)       >= ?TRAJ_RESET_COOLDOWN_MS,
 
     case LC of
+        %% Note: idle intentionally has no fall (¬RobUp) handler. Pre-flight
+        %% queued WPs (ADD before first FB_Tap) survive being knocked over.
         idle ->
-            if FB_Edge andalso Reset_OK ->
-                   %% phase 5, keep the queued waypoint array, only the pose
-                   %% and csv_logger baseline are reset. operator uses Clear_All
-                   %% on the wire to wipe waypoints
+            if FB_Tap andalso Reset_OK ->
+                   %% Idle is started by tap only — no instant-on-press. Waypoints
+                   %% are preserved (only Clear_All / hold-reset wipes them).
                    csv_logger:reset(),
+                   traj_planner:print_transition(idle, running, TS),
                    RS2 = RS#rstate{lifecycle            = running,
                                    lifecycle_entered_ms = Now,
                                    last_traj_action_ms  = Now,
-                                   pose = #pose{}},
+                                   pose                 = #pose{}},
                    {running, TS, RS2#rstate.pose, RS2};
+               FB_Hold_500 andalso Reset_OK ->
+                   %% Safety wipe — Reset_OK gates against repeat-firing while
+                   %% the operator keeps holding past 500 ms.
+                   traj_planner:print_transition(idle, idle, TS),
+                   RS2 = go_idle(RS, TS, Now),
+                   {idle, RS2#rstate.traj, RS2#rstate.pose, RS2};
                true ->
                    {idle, TS, RS#rstate.pose, RS}
             end;
 
         running ->
             if not RobUp ->
-                   %% phase 5, keep traj across reset so queued waypoints
-                   %% persist, operator uses Clear_All over the wire to wipe
-                   RS2 = RS#rstate{lifecycle = idle,
-                                   last_reset_ms = Now},
-                   {idle, TS, RS2#rstate.pose, RS2};
+                   traj_planner:print_transition(running, idle, TS),
+                   RS2 = go_idle(RS, TS, Now),
+                   {idle, RS2#rstate.traj, RS2#rstate.pose, RS2};
                FB_Hold_500 ->
-                   %% phase 5, keep traj across reset so queued waypoints
-                   %% persist, operator uses Clear_All over the wire to wipe
-                   RS2 = RS#rstate{lifecycle = idle,
-                                   last_reset_ms = Now},
-                   {idle, TS, RS2#rstate.pose, RS2};
-               FB_Edge andalso Traj_OK ->
+                   traj_planner:print_transition(running, idle, TS),
+                   RS2 = go_idle(RS, TS, Now),
+                   {idle, RS2#rstate.traj, RS2#rstate.pose, RS2};
+               FB_Tap andalso Traj_OK ->
+                   traj_planner:print_transition(running, paused, TS),
                    RS2 = RS#rstate{lifecycle            = paused,
                                    lifecycle_entered_ms = Now,
                                    last_traj_action_ms  = Now},
@@ -434,45 +491,34 @@ lifecycle_step(RS, FB_Edge, FB_Hold_500, Now) ->
 
         paused ->
             if not RobUp ->
-                   %% phase 5, keep traj across reset so queued waypoints
-                   %% persist, operator uses Clear_All over the wire to wipe
-                   RS2 = RS#rstate{lifecycle = idle,
-                                   last_reset_ms = Now},
-                   {idle, TS, RS2#rstate.pose, RS2};
+                   traj_planner:print_transition(paused, idle, TS),
+                   RS2 = go_idle(RS, TS, Now),
+                   {idle, RS2#rstate.traj, RS2#rstate.pose, RS2};
                FB_Hold_500 ->
-                   %% phase 5, keep traj across reset so queued waypoints
-                   %% persist, operator uses Clear_All over the wire to wipe
-                   RS2 = RS#rstate{lifecycle = idle,
-                                   last_reset_ms = Now},
-                   {idle, TS, RS2#rstate.pose, RS2};
-               FB_Edge andalso Traj_OK ->
+                   traj_planner:print_transition(paused, idle, TS),
+                   RS2 = go_idle(RS, TS, Now),
+                   {idle, RS2#rstate.traj, RS2#rstate.pose, RS2};
+               FB_Tap andalso Traj_OK ->
+                   traj_planner:print_transition(paused, running, TS),
                    RS2 = RS#rstate{lifecycle            = running,
                                    lifecycle_entered_ms = Now,
                                    last_traj_action_ms  = Now},
                    {running, TS, RS2#rstate.pose, RS2};
                true ->
                    {paused, TS, RS#rstate.pose, RS}
-            end;
-
-        finished ->
-            if FB_Hold_500 ->
-                   %% phase 5, keep traj across reset so queued waypoints
-                   %% persist, operator uses Clear_All over the wire to wipe
-                   RS2 = RS#rstate{lifecycle = idle,
-                                   last_reset_ms = Now},
-                   {idle, TS, RS2#rstate.pose, RS2};
-               FB_Edge ->
-                   %% phase 5, same policy as idle→running, keep waypoint array
-                   csv_logger:reset(),
-                   RS2 = RS#rstate{lifecycle            = running,
-                                   lifecycle_entered_ms = Now,
-                                   last_traj_action_ms  = Now,
-                                   pose = #pose{}},
-                   {running, TS, RS2#rstate.pose, RS2};
-               true ->
-                   {finished, TS, RS#rstate.pose, RS}
             end
     end.
+
+%% Single-source-of-truth →idle helper. Every reset destination (hold, fall,
+%% traj-done, cancel-drain, CLEAR_ALL) routes through here: pose to origin,
+%% traj fully wiped (including last_pose — see traj_planner:clear_remaining/1),
+%% 1 s reset cooldown stamped so the LED + Reset_OK gate stay consistent.
+go_idle(RS, TS, Now) ->
+    TS2 = traj_planner:clear_remaining(TS),
+    RS#rstate{lifecycle     = idle,
+              last_reset_ms = Now,
+              pose          = #pose{},
+              traj          = TS2}.
 
 %%% ═══════════════════════════════════════════════════════════════════════════
 %%% LED display
@@ -484,8 +530,7 @@ update_leds(Lifecycle, Last_Reset_Ms, Now, CmdRx) ->
         idle when In_Cooldown -> led_control:traj_reset_cooldown();
         idle     -> led_control:idle();
         running  -> led_control:traj_running();
-        paused   -> led_control:traj_paused();
-        finished -> led_control:traj_finished()
+        paused   -> led_control:traj_paused()
     end,
     %% override led1 if cmd-rx fsm has somthing to show
     %% led2 stays w/ lifecycle so we can see both at the same time
@@ -659,14 +704,15 @@ dispatch_frame(false, ?CMD_CTRL_CANCEL_N_COMMIT, CR = #cmd_rx{state = want_n_com
 dispatch_frame(_Kind, _Payload, CR) ->
     {none, pulse(reset_cmd_rx(CR), cmd_error, ?CMD_LED_PULSE_ERROR)}.
 
-%% phase 5, apply a decoded action to the live #traj_state{} and print the
-%% resulting array. returns {NewTS, NewPose, NewLC} so the caller can also pick
-%% up a pose reset (Clear_All zeroes pose values) and a lifecycle hint
-%% (append-while-finished goes to paused, append while running with <2 waypoints
-%% remaining also pauses so phase 6 can rebuild the spline before resume).
+%% Apply a decoded action to the live #traj_state{} and print the resulting
+%% array. Returns {NewTS, NewPose, NewLC} so the caller can also pick up a
+%% pose reset (Clear_All zeroes pose values). Spline rebuild now happens
+%% inside traj_planner's mutators (phase 6), and the finished→running
+%% reactivation is owned by the lifecycle FSM in lifecycle_step/4 — so no
+%% lifecycle hints are emitted from here anymore.
 %%
-%% reference point for ADD is the last queued waypoint, or current pose if the
-%% array is empty
+%% Reference point for ADD is the last queued waypoint, or current pose if
+%% the array is empty.
 apply_cmd_action(none, TS, Pose, LC) -> {TS, Pose, LC};
 
 apply_cmd_action({append, DX, DY}, TS, Pose, LC) ->
@@ -677,26 +723,9 @@ apply_cmd_action({append, DX, DY}, TS, Pose, LC) ->
         end,
     AbsX = LastX + float(DX),
     AbsY = LastY + float(DY),
-    PreCount = traj_planner:waypoint_count(TS),
     TS2 = traj_planner:append_waypoint(AbsX, AbsY, TS),
     traj_planner:print_waypoints(TS2),
-
-    %% phase 6 placeholder, real spline call goes here, not wired yet
-    %% if PreCount >= 2, extend existing path from old-last to new point,
-    %%   e.g. spline:extend_path(Path, {LastX, LastY}, {AbsX, AbsY}, 30)
-    %% otherwise (PreCount =< 1), pause traj and rebuild from old-last to new,
-    %%   e.g. spline:build_path([{LastX, LastY}, {AbsX, AbsY}], 30)
-
-    %% lifecycle hint, finished+append goes to paused so operator presses F+B
-    %% to resume against the new array. running with <2 waypoints in flight
-    %% also pauses so the rebuild from old-last to new can happen cleanly.
-    %% other lifecycles unchanged.
-    LC_New = case LC of
-        finished                          -> paused;
-        running when PreCount =< 1        -> paused;
-        _                                 -> LC
-    end,
-    {TS2, Pose, LC_New};
+    {TS2, Pose, LC};
 
 apply_cmd_action(cancel_last, TS, Pose, LC) ->
     TS2 = traj_planner:cancel_last(TS),

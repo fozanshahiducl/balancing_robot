@@ -8,9 +8,15 @@
 %%%
 %%% The first and last waypoints are reflected outward to create phantom
 %%% control points so every segment starts and ends with the correct tangent.
+%%%
+%%% build_path_continuing/3 is the mid-cruise rebuild variant. Instead of
+%%% reflecting the second waypoint to seed the initial tangent, it takes an
+%%% explicit Seed control point — typically the second-last visited waypoint,
+%%% a point the robot has already passed through. That preserves the tangent
+%%% at the splice with the previous path so pure_pursuit doesn't see a step.
 %%% ═══════════════════════════════════════════════════════════════════════════
 
--export([build_path/2, config_string/0]).
+-export([build_path/2, build_path_continuing/3, config_string/0]).
 
 -define(SPLINE_RES, 30).   %% subpoints per segment
 
@@ -21,6 +27,21 @@ build_path(WPs, _Res) ->
     P_Last = lists:last(WPs),
     P_Prev = lists:nth(length(WPs) - 1, WPs),
     Extended = [reflect(P1, P2) | WPs] ++ [reflect(P_Last, P_Prev)],
+    sample_all_segments(Extended).
+
+%% Mid-cruise rebuild. Seed replaces the leading reflected phantom; the
+%% trailing phantom is still computed by reflection. Degenerates safely on
+%% short waypoint lists (Catmull-Rom needs two real control points minimum).
+-spec build_path_continuing({float(), float()},
+                            [{float(), float()}],
+                            pos_integer()) ->
+    [{float(), float()}].
+build_path_continuing(_Seed, [], _Res) -> [];
+build_path_continuing(_Seed, [_Single], _Res) -> [];
+build_path_continuing(Seed, WPs, _Res) ->
+    P_Last = lists:last(WPs),
+    P_Prev = lists:nth(length(WPs) - 1, WPs),
+    Extended = [Seed | WPs] ++ [reflect(P_Last, P_Prev)],
     sample_all_segments(Extended).
 
 -spec config_string() -> string().

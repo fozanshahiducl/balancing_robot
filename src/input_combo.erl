@@ -17,12 +17,19 @@
 %%%   - A cooldown timer after each action prevents double-firing.
 %%% ═══════════════════════════════════════════════════════════════════════════
 
--export([rising_edge/2, hold_check/3, config_string/0]).
+-export([rising_edge/2, falling_edge/2, hold_check/3, config_string/0]).
 
 %% True only on the single tick where Curr becomes true.
 -spec rising_edge(boolean(), boolean()) -> boolean().
 rising_edge(true,  false) -> true;
 rising_edge(_Curr, _Prev) -> false.
+
+%% True only on the single tick where Curr becomes false.
+%% Pair with the caller's stored held_ms to distinguish a tap (short held)
+%% from the trailing release of a long-hold action.
+-spec falling_edge(boolean(), boolean()) -> boolean().
+falling_edge(false, true) -> true;
+falling_edge(_Curr, _Prev) -> false.
 
 %% Returns updated hold duration in ms.
 %%   Curr false          → 0 (released, reset)
